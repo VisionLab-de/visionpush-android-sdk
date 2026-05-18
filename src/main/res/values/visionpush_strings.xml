@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    VisionPush Android SDK – Default string resources.
+    Host applications can override these values in their own strings.xml.
+-->
+<resources>
+    <!-- Default notification channel name shown in Android system settings -->
+    <string name="visionpush_default_channel_name" translatable="false">Notifications</string>
+</resources>

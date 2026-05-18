@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    VisionPush Android SDK – Library Manifest
+
+    This manifest is merged into the host application manifest at build time.
+    It declares the minimum permissions, services, and receivers required for
+    FCM push notification delivery and notification-open tracking.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- ── Permissions ────────────────────────────────────────────────────── -->
+
+    <!-- Required for scheduling WorkManager sync tasks -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Required on API 33+ to post notifications (runtime-requested by SDK) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Required for scheduling WorkManager constraints (boot-completed retry) -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Required for exact-time WorkManager constraints on API 31+ -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- Required for vibration on notification display -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application>
+
+        <!-- ── FCM Messaging Service ─────────────────────────────────────── -->
+        <!--
+            Handles incoming FCM messages and token refresh events.
+            The host app can subclass VisionPushMessagingService if additional
+            message processing is required, but this default registration is
+            sufficient for standard SDK usage.
+        -->
+        <service
+            android:name="de.visionlab.visionpush.VisionPushMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- ── Notification Open Tracking Receiver ───────────────────────── -->
+        <!--
+            Receives broadcast intents fired when the user taps a notification
+            or an action button. Records the event to the VisionPush API and
+            then forwards the deep-link intent to the host application.
+        -->
+        <receiver
+            android:name="de.visionlab.visionpush.NotificationTracker$OpenReceiver"
+            android:exported="false" />
+
+        <!-- ── WorkManager Initializer (disable auto-init for custom init) ── -->
+        <!--
+            We use the default WorkManager initializer. Remove this block and
+            add a custom WorkManagerInitializer if the host app requires
+            on-demand initialization via Configuration.Provider.
+        -->
+
+        <!-- ── Default Notification Channel metadata ─────────────────────── -->
+        <!--
+            These meta-data values provide SDK-level defaults that can be
+            overridden at runtime via VisionPush.setDefaultNotificationChannel().
+        -->
+        <meta-data
+            android:name="de.visionlab.visionpush.default_channel_id"
+            android:value="visionpush_default" />
+
+        <meta-data
+            android:name="de.visionlab.visionpush.default_channel_name"
+            android:resource="@string/visionpush_default_channel_name" />
+
+    </application>
+
+</manifest>
