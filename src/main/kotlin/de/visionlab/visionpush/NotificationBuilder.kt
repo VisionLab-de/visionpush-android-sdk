@@ -161,6 +161,7 @@ internal class NotificationBuilder(private val context: Context) {
             putExtra(NotificationTracker.EXTRA_NOTIFICATION_ID, notification.id)
             putExtra(NotificationTracker.EXTRA_SYSTEM_NOTIFICATION_ID, notificationId)
             putExtra(NotificationTracker.EXTRA_EVENT_TYPE, NotificationEvent.EventType.OPENED.apiKey)
+            notification.campaignId?.let { putExtra(NotificationTracker.EXTRA_CAMPAIGN_ID, it) }
             notification.deepLink?.let { putExtra(NotificationTracker.EXTRA_DEEP_LINK, it) }
         }
         return PendingIntent.getBroadcast(
@@ -183,6 +184,7 @@ internal class NotificationBuilder(private val context: Context) {
             putExtra(NotificationTracker.EXTRA_NOTIFICATION_ID, notification.id)
             putExtra(NotificationTracker.EXTRA_SYSTEM_NOTIFICATION_ID, notificationId)
             putExtra(NotificationTracker.EXTRA_EVENT_TYPE, NotificationEvent.EventType.DISMISSED.apiKey)
+            notification.campaignId?.let { putExtra(NotificationTracker.EXTRA_CAMPAIGN_ID, it) }
         }
         return PendingIntent.getBroadcast(
             context,
@@ -210,6 +212,7 @@ internal class NotificationBuilder(private val context: Context) {
             putExtra(NotificationTracker.EXTRA_SYSTEM_NOTIFICATION_ID, notificationId)
             putExtra(NotificationTracker.EXTRA_EVENT_TYPE, NotificationEvent.EventType.ACTION_TAPPED.apiKey)
             putExtra(NotificationTracker.EXTRA_ACTION_ID, action.actionId)
+            notification.campaignId?.let { putExtra(NotificationTracker.EXTRA_CAMPAIGN_ID, it) }
             val deepLink = action.deepLink ?: notification.deepLink
             deepLink?.let { putExtra(NotificationTracker.EXTRA_DEEP_LINK, it) }
         }

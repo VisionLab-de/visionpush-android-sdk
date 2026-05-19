@@ -99,6 +99,8 @@ internal data class DeviceRegistration(
 data class VisionPushNotification(
     /** Unique server-assigned notification identifier (UUID). */
     val id: String,
+    /** Campaign ID for open/click analytics tracking. */
+    val campaignId: String? = null,
     /** Primary title line displayed in bold. */
     val title: String,
     /** Body text shown below the title. */
@@ -156,6 +158,7 @@ data class VisionPushNotification(
 
             return VisionPushNotification(
                 id = json.getString("id"),
+                campaignId = json.optString("campaign_id").takeIf { it.isNotBlank() },
                 title = json.optString("title", ""),
                 body = json.optString("body", ""),
                 imageUrl = json.optString("image_url").takeIf { it.isNotBlank() },
@@ -241,6 +244,10 @@ internal data class NotificationEvent(
     val eventType: EventType,
     /** Present when [eventType] is [EventType.ACTION_TAPPED]. */
     val actionId: String? = null,
+    /** Campaign ID extracted from the `vp_campaign_id` FCM data field. */
+    val campaignId: String? = null,
+    /** Device ID from local SDK storage — enables per-device analytics. */
+    val deviceId: String? = null,
     val occurredAtMs: Long = System.currentTimeMillis()
 ) : JsonSerializable {
 
@@ -256,6 +263,8 @@ internal data class NotificationEvent(
         put("action_id", actionId ?: JSONObject.NULL)
         put("occurred_at_ms", occurredAtMs)
         put("platform", "android")
+        campaignId?.let { put("campaign_id", it) }
+        deviceId?.let { put("device_id", it) }
     }
 }
 
@@ -288,6 +297,7 @@ internal object WorkerKeys {
     const val KEY_NOTIFICATION_ID = "notification_id"
     const val KEY_EVENT_TYPE = "event_type"
     const val KEY_ACTION_ID = "action_id"
+    const val KEY_CAMPAIGN_ID = "campaign_id"
     const val KEY_FCM_TOKEN = "fcm_token"
     const val KEY_RETRY_COUNT = "retry_count"
 }

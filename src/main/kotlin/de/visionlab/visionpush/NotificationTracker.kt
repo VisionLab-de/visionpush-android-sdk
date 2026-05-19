@@ -50,6 +50,7 @@ class NotificationTracker private constructor() {
             val systemNotifId = intent.getIntExtra(EXTRA_SYSTEM_NOTIFICATION_ID, -1)
             val eventTypeKey = intent.getStringExtra(EXTRA_EVENT_TYPE) ?: return
             val actionId = intent.getStringExtra(EXTRA_ACTION_ID)
+            val campaignId = intent.getStringExtra(EXTRA_CAMPAIGN_ID)
             val deepLink = intent.getStringExtra(EXTRA_DEEP_LINK)
 
             val eventType = NotificationEvent.EventType.values()
@@ -66,7 +67,7 @@ class NotificationTracker private constructor() {
             }
 
             // Enqueue the tracking API call via WorkManager (survives process death)
-            enqueueTrackingWork(context, notificationId, eventType, actionId)
+            enqueueTrackingWork(context, notificationId, eventType, actionId, campaignId)
 
             // Invoke the app-level custom handler (runs in the same process)
             VisionPush.internalNotificationOpenCallback?.let { callback ->
@@ -128,6 +129,7 @@ class NotificationTracker private constructor() {
             val eventTypeKey = inputData.getString(WorkerKeys.KEY_EVENT_TYPE)
                 ?: return Result.failure()
             val actionId = inputData.getString(WorkerKeys.KEY_ACTION_ID)
+            val campaignId = inputData.getString(WorkerKeys.KEY_CAMPAIGN_ID)
 
             val eventType = NotificationEvent.EventType.values()
                 .firstOrNull { it.apiKey == eventTypeKey }
@@ -136,7 +138,9 @@ class NotificationTracker private constructor() {
             val event = NotificationEvent(
                 notificationId = notificationId,
                 eventType = eventType,
-                actionId = actionId
+                actionId = actionId,
+                campaignId = campaignId,
+                deviceId = VisionPush.getDeviceId()
             )
 
             // runBlocking is acceptable here because doWork() already runs on a
@@ -169,6 +173,7 @@ class NotificationTracker private constructor() {
         const val EXTRA_SYSTEM_NOTIFICATION_ID = "vp_system_notification_id"
         const val EXTRA_EVENT_TYPE = "vp_event_type"
         const val EXTRA_ACTION_ID = "vp_action_id"
+        const val EXTRA_CAMPAIGN_ID = "vp_campaign_id"
         const val EXTRA_DEEP_LINK = "vp_deep_link"
 
         // WorkManager tag used for de-duplication queries
@@ -184,12 +189,14 @@ class NotificationTracker private constructor() {
             context: Context,
             notificationId: String,
             eventType: NotificationEvent.EventType,
-            actionId: String?
+            actionId: String?,
+            campaignId: String? = null
         ) {
             val inputData = Data.Builder()
                 .putString(WorkerKeys.KEY_NOTIFICATION_ID, notificationId)
                 .putString(WorkerKeys.KEY_EVENT_TYPE, eventType.apiKey)
                 .apply { if (actionId != null) putString(WorkerKeys.KEY_ACTION_ID, actionId) }
+                .apply { if (campaignId != null) putString(WorkerKeys.KEY_CAMPAIGN_ID, campaignId) }
                 .build()
 
             val constraints = Constraints.Builder()
