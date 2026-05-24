@@ -234,11 +234,13 @@ object VisionPush {
             internalIamController = InAppMessageController(appContext as android.app.Application)
             activeConfig = config
 
+            // Create the default notification channel inside the lock so the channel
+            // always exists before any notification can be posted, even when
+            // initializeWithConfig() is called from multiple threads simultaneously.
+            notificationBuilder.ensureDefaultChannelExists()
+
             initialized = true
         }
-
-        // These calls are safe outside the lock as they only read the now-set references.
-        notificationBuilder.ensureDefaultChannelExists()
 
         // GDPR/CCPA: skip backend registration until consent is granted.
         if (config.consentRequired && !isConsentGiven(appContext)) {
@@ -849,6 +851,26 @@ object VisionPush {
             }
             withContext(Dispatchers.Main) { callback?.invoke(result) }
         }
+    }
+
+    /**
+     * Records a named conversion event with an associated double-precision numeric value.
+     *
+     * This overload accepts a [Double] value for interoperability with callers that
+     * work with double-precision numbers (e.g. the React Native bridge).
+     *
+     * @param name     Outcome identifier, max 256 characters.
+     * @param value    Double-precision numeric value to attach (e.g. revenue).
+     * @param callback Optional result callback invoked on the main thread.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun sendOutcomeWithValue(
+        name: String,
+        value: Double,
+        callback: ((VisionPushResult<Unit>) -> Unit)? = null
+    ) {
+        sendOutcomeWithValue(name, value.toFloat(), callback)
     }
 
     // ── Server-Side Tags ────────────────────────────────────────────────────
