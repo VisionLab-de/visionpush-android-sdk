@@ -39,3 +39,32 @@
 
 # ── Coroutines (suppress debug agent warning) ────────────────────────────────
 -dontwarn kotlinx.coroutines.debug.*
+
+# ── Internal JSON models (toJson/fromJson use reflection-sensitive fields) ───
+-keep class de.visionlab.visionpush.DeviceRegistration { *; }
+-keep class de.visionlab.visionpush.NotificationEvent { *; }
+-keep class de.visionlab.visionpush.NotificationEvent$EventType { *; }
+-keep class de.visionlab.visionpush.ApiResponse { *; }
+-keepclassmembers class de.visionlab.visionpush.** {
+    *** toJson();
+    static *** fromJson(...);
+}
+
+# ── New Enterprise + IAM classes ─────────────────────────────────────────────
+-keep public class de.visionlab.visionpush.UserProfile { *; }
+-keep public class de.visionlab.visionpush.VisionPushNotificationRecord { *; }
+-keep public class de.visionlab.visionpush.InAppMessage { *; }
+-keep public class de.visionlab.visionpush.InAppMessageController { *; }
+-keep public class de.visionlab.visionpush.IAMButton { *; }
+-keep public class de.visionlab.visionpush.IAMAction { *; }
+-keep public class de.visionlab.visionpush.IAMTrigger { *; }
+-keep public class de.visionlab.visionpush.IAMType { *; }
+-keep public class de.visionlab.visionpush.IAMActionType { *; }
+-keep public class de.visionlab.visionpush.IAMTriggerType { *; }
+-keep public class de.visionlab.visionpush.IAMBannerPosition { *; }
+
+# ── Kotlin Flow / coroutines extensions ──────────────────────────────────────
+-keep class de.visionlab.visionpush.VisionPushKtxKt { *; }
+
+# ── Diagnostics ───────────────────────────────────────────────────────────────
+-keep public class de.visionlab.visionpush.DiagnosticReport { *; }

@@ -1,0 +1,11 @@
+# Android Studio generated — contains machine-local SDK path
+local.properties
+
+# Build outputs
+build/
+.gradle/
+
+# Android Studio project files
+*.iml
+.idea/
+*.DS_Store

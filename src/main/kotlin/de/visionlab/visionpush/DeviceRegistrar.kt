@@ -1,16 +1,19 @@
 package de.visionlab.visionpush
 
-import android.app.NotificationManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.os.Build
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import androidx.core.app.NotificationManagerCompat
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import android.os.Build
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
-import java.util.Locale
+import java.util.UUID
 
 /**
  * Manages device registration with the VisionPush backend.
@@ -36,7 +39,24 @@ internal class DeviceRegistrar(
     // ── Shared preferences ──────────────────────────────────────────────────
 
     private val prefs: SharedPreferences by lazy {
-        context.getSharedPreferences(PREFS_FILE_NAME, Context.MODE_PRIVATE)
+        try {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            EncryptedSharedPreferences.create(
+                context,
+                PREFS_FILE_NAME,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+        } catch (e: Exception) {
+            // Fallback: some vendor ROMs or very old devices may fail to provision the
+            // Android Keystore. Plain SharedPreferences is still MODE_PRIVATE (no other
+            // app can read it without root), so this is an acceptable degradation.
+            VisionPushLogger.w(TAG, "EncryptedSharedPreferences unavailable – using plain storage: ${e.message}")
+            context.getSharedPreferences("${PREFS_FILE_NAME}_plain", Context.MODE_PRIVATE)
+        }
     }
 
     // ── Registration state accessors ────────────────────────────────────────
@@ -61,6 +81,16 @@ internal class DeviceRegistrar(
         get() = prefs.getBoolean(KEY_OPTED_OUT, false)
         set(value) = prefs.edit().putBoolean(KEY_OPTED_OUT, value).apply()
 
+    /**
+     * Stable anonymous identifier for this device installation. Generated once on first
+     * launch and persisted. Resets only when app data is cleared or on reinstall.
+     * Does not require any permissions.
+     */
+    internal val anonymousId: String
+        get() = prefs.getString(KEY_ANONYMOUS_ID, null) ?: UUID.randomUUID().toString().also { uuid ->
+            prefs.edit().putString(KEY_ANONYMOUS_ID, uuid).apply()
+        }
+
     // ── Public operations ───────────────────────────────────────────────────
 
     /**
@@ -73,12 +103,15 @@ internal class DeviceRegistrar(
      * @param forceRefresh  When `true` the registration is always sent, even if
      *                      nothing appears to have changed locally.
      */
-    suspend fun register(forceRefresh: Boolean = false): VisionPushResult<String> {
+    suspend fun register(
+        forceRefresh: Boolean = false,
+        initialTags: Map<String, String> = emptyMap()
+    ): VisionPushResult<String> {
         val token = fetchFcmToken() ?: return VisionPushResult.Failure(
             VisionPushError.TokenUnavailable()
         )
 
-        val registration = buildRegistration(token)
+        val registration = buildRegistration(token, initialTags)
         val stateKey = registration.stateKey()
 
         // Skip if the device state has not changed and forceRefresh is not set
@@ -122,9 +155,13 @@ internal class DeviceRegistrar(
      */
     suspend fun setOptedOut(optedOut: Boolean): VisionPushResult<Unit> {
         isOptedOut = optedOut
-        val token = lastRegisteredToken
+        val id = deviceId
             ?: return VisionPushResult.Failure(VisionPushError.TokenUnavailable())
-        return apiClient.updateOptStatus(token, optedOut)
+        return if (optedOut) {
+            apiClient.optOut(id)
+        } else {
+            apiClient.optIn(id)
+        }
     }
 
     /**
@@ -132,9 +169,9 @@ internal class DeviceRegistrar(
      * all locally persisted state. Intended to be called during user logout.
      */
     suspend fun unregister(): VisionPushResult<Unit> {
-        val token = lastRegisteredToken
-        val result = if (token != null) {
-            apiClient.deleteDevice(token)
+        val id = deviceId
+        val result = if (id != null) {
+            apiClient.deleteDevice(id)
         } else {
             VisionPushResult.Success(Unit) // Nothing to delete
         }
@@ -159,37 +196,84 @@ internal class DeviceRegistrar(
     }
 
     /** Constructs a [DeviceRegistration] from the current device environment. */
-    private fun buildRegistration(token: String): DeviceRegistration {
-        val locale = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            context.resources.configuration.locales[0].toLanguageTag()
+    private fun buildRegistration(token: String, tags: Map<String, String> = emptyMap()): DeviceRegistration {
+        val currentLocale = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            context.resources.configuration.locales[0]
         } else {
             @Suppress("DEPRECATION")
-            context.resources.configuration.locale.toLanguageTag()
+            context.resources.configuration.locale
+        }
+        val locale = currentLocale.toLanguageTag()
+        val country = currentLocale.country.takeIf { it.isNotBlank() }
+
+        val pkgInfo = try {
+            context.packageManager.getPackageInfo(context.packageName, 0)
+        } catch (_: PackageManager.NameNotFoundException) { null }
+
+        val appVersion = pkgInfo?.versionName ?: "unknown"
+
+        @Suppress("DEPRECATION")
+        val appBuildNumber = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            pkgInfo?.longVersionCode?.toString()
+        } else {
+            pkgInfo?.versionCode?.toString()
         }
 
-        val appVersion = try {
-            val info = context.packageManager.getPackageInfo(context.packageName, 0)
-            info.versionName ?: "unknown"
-        } catch (_: PackageManager.NameNotFoundException) {
-            "unknown"
+        val tz = java.util.TimeZone.getDefault()
+        val timezone = try { tz.id } catch (_: Exception) { null }
+        val timezoneOffset = tz.rawOffset / 60_000  // raw offset in minutes (no DST)
+
+        val environment = if (config.apiKey.startsWith("vp_test_")) "sandbox" else "production"
+
+        val screenLayout = context.resources.configuration.screenLayout and
+                android.content.res.Configuration.SCREENLAYOUT_SIZE_MASK
+        val deviceType = when {
+            screenLayout >= android.content.res.Configuration.SCREENLAYOUT_SIZE_LARGE -> "tablet"
+            else -> "phone"
         }
 
         return DeviceRegistration(
-            fcmToken = token,
+            appId = config.appId,
+            pushToken = token,
             externalId = externalId,
+            installationId = anonymousId,
+            anonymousId = anonymousId,
             locale = locale,
-            sdkVersion = Build.VERSION.SDK_INT,
+            country = country,
+            deviceOs = "Android ${Build.VERSION.RELEASE}",
             deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}",
-            appPackageName = context.packageName,
             appVersion = appVersion,
-            notificationsEnabled = areNotificationsEnabled(),
-            optedOut = isOptedOut
+            timezone = timezone,
+            timezoneOffset = timezoneOffset,
+            environment = environment,
+            bundleId = context.packageName,
+            appBuildNumber = appBuildNumber,
+            deviceType = deviceType,
+            deviceManufacturer = Build.MANUFACTURER,
+            networkType = currentNetworkType(),
+            notificationPermission = currentNotificationPermission(),
+            tags = tags.takeIf { it.isNotEmpty() }
         )
     }
 
-    /** Returns `true` when system-level notifications are enabled for this app. */
-    private fun areNotificationsEnabled(): Boolean =
-        NotificationManagerCompat.from(context).areNotificationsEnabled()
+    private fun currentNetworkType(): String {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return "unknown"
+            val network = cm.activeNetwork ?: return "none"
+            val caps = cm.getNetworkCapabilities(network) ?: return "none"
+            when {
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                else -> "other"
+            }
+        } catch (_: SecurityException) {
+            "unknown"
+        }
+    }
+
+    private fun currentNotificationPermission(): String =
+        if (NotificationManagerCompat.from(context).areNotificationsEnabled()) "granted" else "denied"
 
     /** Clears all SDK-persisted state from SharedPreferences. */
     private fun clearLocalState() {
@@ -201,7 +285,7 @@ internal class DeviceRegistrar(
      * state. Used for change-detection to avoid unnecessary API calls.
      */
     private fun DeviceRegistration.stateKey(): String =
-        "${fcmToken}|${externalId}|${notificationsEnabled}|${optedOut}|${locale}"
+        "${pushToken}|${externalId}|${anonymousId}|${locale}|${country}|${deviceOs}|${environment}|${bundleId}|${appBuildNumber}|${deviceType}|${deviceManufacturer}|${networkType}|${notificationPermission}"
 
     // ── Companion ───────────────────────────────────────────────────────────
 
@@ -213,5 +297,6 @@ internal class DeviceRegistrar(
         private const val KEY_EXTERNAL_ID = "external_id"
         private const val KEY_OPTED_OUT = "opted_out"
         private const val KEY_LAST_STATE = "last_reg_state"
+        private const val KEY_ANONYMOUS_ID = "anonymous_id"
     }
 }

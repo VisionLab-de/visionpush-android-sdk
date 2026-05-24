@@ -16,9 +16,10 @@ package de.visionlab.visionpush
  *             is VisionPushError.NetworkError    -> scheduleRetry(err.cause)
  *             is VisionPushError.ApiError        -> log(err.message)
  *             is VisionPushError.PermissionDenied -> promptUser()
- *             is VisionPushError.InvalidConfig   -> log(err.message)
+ *             is VisionPushError.InvalidConfig    -> log(err.message)
+ *             is VisionPushError.InvalidArgument  -> log(err.message)
  *             is VisionPushError.TokenUnavailable -> log(err.message)
- *             is VisionPushError.Unknown         -> log(err.cause)
+ *             is VisionPushError.Unknown          -> log(err.cause)
  *         }
  *     }
  * }
@@ -83,6 +84,27 @@ sealed class VisionPushError(message: String, cause: Throwable? = null) :
      */
     class TokenUnavailable(override val message: String = "FCM token not yet available.") :
         VisionPushError(message)
+
+    /**
+     * A method was called with an argument that violates the SDK's documented
+     * constraints (e.g. [VisionPush.setExternalId] called with a string longer
+     * than 1 024 characters).
+     *
+     * @property message Description of the specific constraint that was violated.
+     */
+    class InvalidArgument(override val message: String) : VisionPushError(message)
+
+    /**
+     * A network operation was blocked because `VisionPushConfig.consentRequired` is `true`
+     * and the user has not yet granted consent via [VisionPush.setConsentGiven].
+     *
+     * This error is thrown (or returned as [VisionPushResult.Failure]) by any method
+     * that would send data to the VisionPush backend.
+     */
+    class ConsentRequired : VisionPushError(
+        "User consent is required before data can be collected. " +
+                "Call VisionPush.setConsentGiven(true) to activate the SDK."
+    )
 
     /**
      * An unexpected error that does not fit any of the specific categories above.

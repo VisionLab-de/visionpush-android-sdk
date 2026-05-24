@@ -9,6 +9,7 @@ plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     id("maven-publish")
+    id("org.jetbrains.dokka")
 }
 
 android {
@@ -33,17 +34,23 @@ android {
         }
     }
 
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+        }
+    }
+
     buildFeatures {
         buildConfig = true
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     kotlinOptions {
-        jvmTarget = "1.8"
+        jvmTarget = "17"
         // Expose suspension functions with a blocking Java-compatible variant via @JvmStatic
         freeCompilerArgs += listOf("-Xjvm-default=all")
     }
@@ -76,6 +83,9 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
 
+    // ── Encrypted storage for sensitive SDK state (FCM token, device ID) ─────
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // ── JSON serialisation (lightweight, zero-dependency) ────────────────────
     implementation("org.json:json:20231013")
 
@@ -83,8 +93,24 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.mockito.kotlin:mockito-kotlin:5.2.1")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
+    testImplementation("org.robolectric:robolectric:4.11.1")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
+}
+
+// ── Dokka API documentation ───────────────────────────────────────────────────
+tasks.withType<org.jetbrains.dokka.gradle.DokkaTask>().configureEach {
+    dokkaSourceSets {
+        named("main") {
+            moduleName.set("VisionPush Android SDK")
+            includes.from("Module.md")
+            sourceLink {
+                localDirectory.set(file("src/main/kotlin"))
+                remoteUrl.set(java.net.URL("https://github.com/visionlab-de/visionpush/tree/main/sdks/android/src/main/kotlin"))
+                remoteLineSuffix.set("#L")
+            }
+        }
+    }
 }
 
 // ── Maven publication (for local/private Maven repository consumption) ────────
@@ -118,6 +144,22 @@ publishing {
                         email.set("sdk@visionpush.de")
                     }
                 }
+            }
+        }
+    }
+
+    repositories {
+        // Local Maven cache — useful for host-app integration testing.
+        mavenLocal()
+
+        // GitHub Packages — published automatically by the sdk-release workflow.
+        // Credentials are injected via GITHUB_ACTOR / GITHUB_TOKEN env vars in CI.
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/visionlab-de/visionpush")
+            credentials {
+                username = System.getenv("GITHUB_ACTOR") ?: project.findProperty("gpr.user") as String?
+                password = System.getenv("GITHUB_TOKEN") ?: project.findProperty("gpr.token") as String?
             }
         }
     }

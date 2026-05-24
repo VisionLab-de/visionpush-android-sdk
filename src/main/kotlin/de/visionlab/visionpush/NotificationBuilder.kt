@@ -19,6 +19,7 @@ import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -31,6 +32,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * - Up to three [NotificationAction] buttons, each backed by a tracking [PendingIntent]
  * - Notification channel management (creation and update)
  * - Deep-link routing via the notification tap intent
+ * - Delivered-event deduplication: FCM may retry delivery of the same message;
+ *   the builder tracks recently shown VP notification IDs to avoid double tracking.
  *
  * All bitmap network operations are performed on [Dispatchers.IO] to keep the
  * main thread free.
@@ -40,6 +43,16 @@ internal class NotificationBuilder(private val context: Context) {
     // ── Atomic notification ID counter ──────────────────────────────────────
     // Uses an AtomicInteger so multiple concurrent notifications don't collide.
     private val notificationIdCounter = AtomicInteger(NOTIFICATION_ID_BASE)
+
+    // ── Delivered-event deduplication ────────────────────────────────────────
+    // Keeps the last N VP notification IDs for which we already enqueued a
+    // DELIVERED event. In-memory only: FCM retries happen within minutes of
+    // the original delivery, so process-restart reset is acceptable.
+    @Suppress("UNCHECKED_CAST")
+    private val recentlyDeliveredIds: LinkedHashMap<String, Unit> =
+        object : LinkedHashMap<String, Unit>(DEDUP_CACHE_SIZE * 2, 0.75f, false) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, Unit>?) = size > DEDUP_CACHE_SIZE
+        }
 
     // ── Channel management ──────────────────────────────────────────────────
 
@@ -108,6 +121,7 @@ internal class NotificationBuilder(private val context: Context) {
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setSmallIcon(resolveSmallIconRes(notification.smallIconName))
             .setColor(Color.parseColor("#0F52BA")) // VisionPush brand blue
+            .setNumber(VisionPush.badgeCount)
 
         // Large icon (round badge next to title)
         if (largeIcon != null) builder.setLargeIcon(largeIcon)
@@ -133,13 +147,47 @@ internal class NotificationBuilder(private val context: Context) {
         // Delete intent for dismiss tracking
         builder.setDeleteIntent(buildDismissIntent(notification, notificationId))
 
-        // Action buttons (max 3, per NotificationCompat contract)
-        notification.actions.take(MAX_ACTIONS).forEachIndexed { index, action ->
+        // Merge per-notification actions with SDK-wide default actions.
+        // Per-notification actions take priority; defaults fill remaining slots.
+        val effectiveActions = if (notification.actions.isNotEmpty()) {
+            val defaultIds = notification.actions.map { it.id }.toSet()
+            notification.actions + VisionPush.defaultActions.filter { it.id !in defaultIds }
+        } else {
+            VisionPush.defaultActions
+        }
+        effectiveActions.take(MAX_ACTIONS).forEachIndexed { index, action ->
             builder.addAction(buildAction(notification, action, notificationId, index))
+        }
+
+        // Notification grouping — group all notifications with the same key in the drawer
+        notification.groupKey?.let { key ->
+            builder.setGroup(key)
+            postGroupSummary(context, notification.channelId, key)
         }
 
         val builtNotification = builder.build()
         postNotification(notificationId, builtNotification)
+
+        // Track delivered event via WorkManager — deduplicated so FCM retries don't
+        // result in duplicate analytics events for the same VP notification ID.
+        val alreadyTracked = synchronized(recentlyDeliveredIds) {
+            if (recentlyDeliveredIds.containsKey(notification.id)) {
+                true
+            } else {
+                recentlyDeliveredIds[notification.id] = Unit
+                false
+            }
+        }
+        if (!alreadyTracked) {
+            NotificationTracker.enqueueTrackingWork(
+                context,
+                notification.id,
+                NotificationEvent.EventType.DELIVERED,
+                actionId = null,
+                campaignId = notification.campaignId
+            )
+        }
+
         return notificationId
     }
 
@@ -211,7 +259,7 @@ internal class NotificationBuilder(private val context: Context) {
             putExtra(NotificationTracker.EXTRA_NOTIFICATION_ID, notification.id)
             putExtra(NotificationTracker.EXTRA_SYSTEM_NOTIFICATION_ID, notificationId)
             putExtra(NotificationTracker.EXTRA_EVENT_TYPE, NotificationEvent.EventType.ACTION_TAPPED.apiKey)
-            putExtra(NotificationTracker.EXTRA_ACTION_ID, action.actionId)
+            putExtra(NotificationTracker.EXTRA_ACTION_ID, action.id)
             notification.campaignId?.let { putExtra(NotificationTracker.EXTRA_CAMPAIGN_ID, it) }
             val deepLink = action.deepLink ?: notification.deepLink
             deepLink?.let { putExtra(NotificationTracker.EXTRA_DEEP_LINK, it) }
@@ -225,7 +273,7 @@ internal class NotificationBuilder(private val context: Context) {
         val iconRes = action.iconName?.let { resolveDrawableRes(it) }
             ?: android.R.drawable.ic_menu_send
 
-        return NotificationCompat.Action.Builder(iconRes, action.label, pendingIntent).build()
+        return NotificationCompat.Action.Builder(iconRes, action.title, pendingIntent).build()
     }
 
     // ── Resource helpers ────────────────────────────────────────────────────
@@ -272,6 +320,11 @@ internal class NotificationBuilder(private val context: Context) {
                 connect()
             }
             if (connection.responseCode != HttpURLConnection.HTTP_OK) return@withContext null
+            val contentLength = connection.contentLength
+            if (contentLength > MAX_BITMAP_BYTES) {
+                VisionPushLogger.w(TAG, "Bitmap at $url exceeds size limit ($contentLength bytes) – skipping.")
+                return@withContext null
+            }
             BitmapFactory.decodeStream(connection.inputStream)
         } catch (e: IOException) {
             VisionPushLogger.w(TAG, "Failed to fetch bitmap from $url: ${e.message}")
@@ -294,6 +347,24 @@ internal class NotificationBuilder(private val context: Context) {
             // POST_NOTIFICATIONS permission not granted on API 33+
             VisionPushLogger.w(TAG, "Cannot post notification – permission denied: ${e.message}")
         }
+    }
+
+    /**
+     * Posts or refreshes a silent group-summary notification for [groupKey].
+     *
+     * Android requires a summary notification to be present before the drawer will
+     * collapse grouped notifications. Uses a stable ID derived from the group key so
+     * repeated calls update the same summary entry rather than stacking new ones.
+     */
+    private fun postGroupSummary(context: Context, channelId: String, groupKey: String) {
+        val summaryId = NOTIFICATION_ID_BASE + groupKey.hashCode().and(0x7FFF)
+        val summary = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(resolveSmallIconRes(null))
+            .setGroup(groupKey)
+            .setGroupSummary(true)
+            .setAutoCancel(true)
+            .build()
+        postNotification(summaryId, summary)
     }
 
     // ── PendingIntent flags ─────────────────────────────────────────────────
@@ -322,5 +393,11 @@ internal class NotificationBuilder(private val context: Context) {
 
         private const val BITMAP_CONNECT_TIMEOUT_MS = 5_000
         private const val BITMAP_READ_TIMEOUT_MS = 10_000
+
+        /** Maximum allowed bitmap download size (5 MB). Prevents OOM from oversized images. */
+        private const val MAX_BITMAP_BYTES = 5 * 1024 * 1024
+
+        /** Maximum VP notification IDs remembered for delivered-event deduplication. */
+        private const val DEDUP_CACHE_SIZE = 50
     }
 }

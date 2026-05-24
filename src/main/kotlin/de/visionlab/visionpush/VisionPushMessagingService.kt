@@ -97,8 +97,13 @@ open class VisionPushMessagingService : FirebaseMessagingService() {
         super.onNewToken(token)
         VisionPushLogger.i(TAG, "FCM token refreshed – re-registering device.")
         serviceScope.launch {
-            VisionPush.internalDeviceRegistrar?.handleTokenRefresh(token)
-                ?.onFailure { error ->
+            val registrar = VisionPush.internalDeviceRegistrar
+            if (registrar == null) {
+                VisionPushLogger.w(TAG, "FCM token received before SDK init – will register on next initialize().")
+                return@launch
+            }
+            registrar.handleTokenRefresh(token)
+                .onFailure { error ->
                     VisionPushLogger.e(TAG, "Token refresh registration failed: ${error.message}")
                     // Enqueue a WorkManager retry so the token eventually reaches the backend
                     VisionPush.scheduleRegistrationSync(applicationContext)
@@ -129,7 +134,7 @@ open class VisionPushMessagingService : FirebaseMessagingService() {
             customHandler(notification)
         }
 
-        if (notification.showSystemNotification) {
+        if (notification.showSystemNotification && VisionPush.foregroundNotificationEnabled) {
             val builder = VisionPush.internalNotificationBuilder
             if (builder != null) {
                 builder.show(notification)

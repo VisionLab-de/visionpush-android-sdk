@@ -356,7 +356,7 @@ The SDK persists the external ID across process restarts and includes it in ever
 
 ```kotlin
 // Read back the current value
-val userId: String? = VisionPush.getExternalId()
+val userId: String? = VisionPush.externalId
 ```
 
 ---
@@ -376,7 +376,7 @@ VisionPush.optOut { result ->
 VisionPush.optIn()
 
 // Check current state
-val optedOut: Boolean = VisionPush.isOptedOut()
+val optedIn: Boolean = VisionPush.isOptedIn
 ```
 
 The callbacks are optional. Kotlin coroutine callers can use `VisionPush.optOut()` / `VisionPush.optIn()` without a lambda in a coroutine context where the result is not needed.
@@ -486,7 +486,7 @@ All methods are on the `VisionPush` singleton object.
 | Method | Signature | Description |
 |---|---|---|
 | `setExternalId` | `(externalId: String?) Unit` | Associate device with an external user ID; `null` clears the association |
-| `getExternalId` | `() String?` | Returns the current external ID or `null` |
+| `externalId` | `String?` | The current external ID, or `null` if not set |
 
 ### Notification Handlers
 
@@ -507,7 +507,7 @@ All methods are on the `VisionPush` singleton object.
 |---|---|---|
 | `optOut` | `(callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Opt the user out of push notifications |
 | `optIn` | `(callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Re-enable push notifications |
-| `isOptedOut` | `() Boolean` | Returns the current opt-out state |
+| `isOptedIn` | `Boolean` | `true` when the user is opted in to push notifications |
 
 ### Device
 
@@ -515,8 +515,8 @@ All methods are on the `VisionPush` singleton object.
 |---|---|---|
 | `syncDevice` | `(callback: ((VisionPushResult<String>) -> Unit)? = null) Unit` | Force an immediate registration sync |
 | `logout` | `(callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Unregister the device and clear all local state |
-| `getDeviceId` | `() String?` | Returns the server-assigned device ID or `null` before first registration |
-| `isInitialized` | `() Boolean` | `true` after a successful `initialize()` call |
+| `deviceId` | `String?` | The server-assigned device ID, or `null` before first registration |
+| `isInitialized` | `Boolean` | `true` after a successful `initialize()` call |
 
 ---
 

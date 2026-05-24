@@ -76,6 +76,8 @@ class NotificationTracker private constructor() {
                     callback(notification)
                 }
             }
+            // Trigger in-app messages queued for notification-open.
+            VisionPush.internalIamController?.triggerNotificationOpen()
 
             // Route the deep-link intent
             if (!deepLink.isNullOrBlank()) {
@@ -99,13 +101,20 @@ class NotificationTracker private constructor() {
         private fun launchDeepLink(context: Context, deepLink: String) {
             try {
                 val uri = Uri.parse(deepLink)
+                val scheme = uri.scheme?.lowercase()
+                // Block schemes that could execute code or access private data.
+                val blockedSchemes = setOf("javascript", "data", "vbscript", "content", "file")
+                if (scheme == null || blockedSchemes.contains(scheme)) {
+                    VisionPushLogger.w(TAG, "Deep-link blocked – unsafe scheme '$scheme'.")
+                    launchHostApp(context)
+                    return
+                }
                 val intent = Intent(Intent.ACTION_VIEW, uri).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(intent)
             } catch (e: Exception) {
                 VisionPushLogger.w(TAG, "Failed to launch deep-link '$deepLink': ${e.message}")
-                // Fall back to opening the launcher activity
                 launchHostApp(context)
             }
         }
@@ -140,7 +149,7 @@ class NotificationTracker private constructor() {
                 eventType = eventType,
                 actionId = actionId,
                 campaignId = campaignId,
-                deviceId = VisionPush.getDeviceId()
+                deviceId = VisionPush.deviceId
             )
 
             // runBlocking is acceptable here because doWork() already runs on a
