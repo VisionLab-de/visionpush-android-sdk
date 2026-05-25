@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Subtle circle ring (mirrors iOS icon) -->
+    <path
+        android:strokeColor="#336EE7F7"
+        android:strokeWidth="1.2"
+        android:fillColor="#00000000"
+        android:pathData="M54,18 m-32,0 a32,32 0 1,0 64,0 a32,32 0 1,0 -64,0"/>
+
+    <!-- Lightning bolt — white with slight blue-tint bottom half -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M62,22 L40,56 H53 L44,86 L68,52 H55 Z"/>
+
+    <!-- Subtle blue-white gradient effect on lower half via semi-transparent overlay -->
+    <path
+        android:fillColor="#1A6EE7F7"
+        android:pathData="M53,56 L44,86 L68,52 H55 Z"/>
+</vector>

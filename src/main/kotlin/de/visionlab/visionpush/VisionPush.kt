@@ -103,6 +103,19 @@ object VisionPush {
     /** Handler invoked when an SDK-internal background error occurs (set via [onError]). */
     @Volatile private var errorHandler: ((VisionPushError) -> Unit)? = null
 
+    /**
+     * Callback invoked on the main thread when the device is successfully registered
+     * with the VisionPush backend. Receives the server-assigned device ID.
+     * Set via [setOnRegisteredListener].
+     */
+    @Volatile private var onRegisteredCallback: ((deviceId: String) -> Unit)? = null
+
+    /**
+     * Callback invoked on the main thread when the initial device registration fails
+     * permanently (after WorkManager retries are exhausted). Set via [setOnRegistrationFailedListener].
+     */
+    @Volatile private var onRegistrationFailedCallback: ((error: Exception) -> Unit)? = null
+
     /** SDK-wide coroutine scope; survives the entire application lifetime. */
     private val sdkScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
@@ -159,6 +172,14 @@ object VisionPush {
      * [android.app.Application.onCreate]. Subsequent calls are safe and
      * update the configuration then re-register the device.
      *
+     * **Registration is asynchronous.** This method returns before the device
+     * is registered with the VisionPush backend. If the FCM token is not yet
+     * available (common on first launch) or the network is unreachable, the
+     * registration attempt fails silently and WorkManager schedules a retry.
+     * Use [setOnRegisteredListener] to be notified when registration completes,
+     * and [setOnRegistrationFailedListener] to be notified when the immediate
+     * attempt fails.
+     *
      * @param context  Any context; only the application context is retained.
      * @param appId    UUID identifying the VisionPush application.
      * @param apiKey   Secret key with prefix `vp_live_` or `vp_test_`.
@@ -193,6 +214,25 @@ object VisionPush {
      *
      * Use this overload when you need full control over all configuration
      * options. Under the hood [initialize] delegates to this method.
+     *
+     * ## Async registration
+     *
+     * Device registration with the VisionPush backend happens asynchronously
+     * inside a coroutine launched by this method. `initializeWithConfig`
+     * (and [initialize]) return to the caller **before** registration is
+     * complete. The following scenarios are possible:
+     *
+     * - **FCM token not yet available** — Firebase may not have delivered an
+     *   FCM token by the time `initialize()` is called (e.g. on first launch or
+     *   after a fresh install). In this case [DeviceRegistrar.register] fails
+     *   and WorkManager schedules a retry once the token becomes available.
+     * - **Network unavailable** — If there is no network connection at init
+     *   time, registration fails and WorkManager retries when connectivity
+     *   is restored.
+     *
+     * In both cases `initialize()` returns without error — use
+     * [setOnRegisteredListener] to be notified when registration eventually
+     * succeeds, and [setOnRegistrationFailedListener] for permanent failures.
      */
     @JvmStatic
     @JvmOverloads
@@ -279,6 +319,7 @@ object VisionPush {
                             internalIamController?.triggerSession()
                         }
                     }
+                    withContext(Dispatchers.Main) { onRegisteredCallback?.invoke(deviceId) }
                 }
                 is VisionPushResult.Failure -> {
                     VisionPushLogger.w(
@@ -286,7 +327,10 @@ object VisionPush {
                         "Initial registration failed: ${regResult.error.message}. " +
                                 "WorkManager will retry when network is available."
                     )
-                    withContext(Dispatchers.Main) { errorHandler?.invoke(regResult.error) }
+                    withContext(Dispatchers.Main) {
+                        errorHandler?.invoke(regResult.error)
+                        onRegistrationFailedCallback?.invoke(regResult.error)
+                    }
                     scheduleRegistrationSync(appContext)
                 }
             }
@@ -573,6 +617,54 @@ object VisionPush {
     @JvmStatic
     fun onError(handler: ((VisionPushError) -> Unit)?) {
         errorHandler = handler
+    }
+
+    /**
+     * Registers a callback invoked on the **main thread** when the device is
+     * successfully registered with the VisionPush backend.
+     *
+     * Because [initialize] returns before registration completes (registration
+     * is asynchronous and may be delayed by an unavailable FCM token or network),
+     * use this listener to react to the registration completing — for example to
+     * retrieve [deviceId] or to call [setExternalId].
+     *
+     * ```kotlin
+     * VisionPush.setOnRegisteredListener { deviceId ->
+     *     Log.d("App", "VisionPush device registered: $deviceId")
+     * }
+     * ```
+     *
+     * Pass `null` to clear the listener.
+     *
+     * @param onRegistered Lambda receiving the server-assigned device ID string.
+     */
+    @JvmStatic
+    fun setOnRegisteredListener(onRegistered: ((deviceId: String) -> Unit)?) {
+        onRegisteredCallback = onRegistered
+    }
+
+    /**
+     * Registers a callback invoked on the **main thread** when the initial device
+     * registration fails (WorkManager has scheduled a retry but the immediate
+     * attempt failed).
+     *
+     * Note: this callback fires for every failed attempt during the initial
+     * [initialize] call. WorkManager may still succeed on a subsequent retry,
+     * in which case [setOnRegisteredListener] will be invoked.
+     *
+     * ```kotlin
+     * VisionPush.setOnRegistrationFailedListener { error ->
+     *     Log.e("App", "VisionPush registration failed: ${error.message}")
+     * }
+     * ```
+     *
+     * Pass `null` to clear the listener.
+     *
+     * @param onFailed Lambda receiving the [Exception] that caused the failure.
+     */
+    @JvmStatic
+    fun setOnRegistrationFailedListener(onFailed: ((error: Exception) -> Unit)?) {
+        onRegistrationFailedCallback = onFailed
     }
 
     // MARK: - Manual Tracking

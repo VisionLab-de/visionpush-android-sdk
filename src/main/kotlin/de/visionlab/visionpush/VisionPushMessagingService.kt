@@ -92,6 +92,12 @@ open class VisionPushMessagingService : FirebaseMessagingService() {
      * Token rotation can happen at any time (e.g. after an app restore, or when
      * FCM invalidates stale tokens). The SDK re-registers the device immediately
      * and enqueues a WorkManager retry if the network is unavailable.
+     *
+     * If the SDK has not yet been initialized when this callback fires (i.e.
+     * [VisionPush.initialize] has not been called yet), the token cannot be
+     * forwarded immediately. In this case a WorkManager sync is scheduled so
+     * that once the SDK is initialized the device registration picks up the
+     * latest token automatically.
      */
     override fun onNewToken(token: String) {
         super.onNewToken(token)
@@ -99,7 +105,12 @@ open class VisionPushMessagingService : FirebaseMessagingService() {
         serviceScope.launch {
             val registrar = VisionPush.internalDeviceRegistrar
             if (registrar == null) {
-                VisionPushLogger.w(TAG, "FCM token received before SDK init – will register on next initialize().")
+                VisionPushLogger.w(
+                    TAG,
+                    "FCM token received before SDK init – scheduling sync for after initialize()."
+                )
+                // Schedule a WorkManager sync so the token is picked up once initialize() runs.
+                RegistrationSyncWorker.enqueue(applicationContext)
                 return@launch
             }
             registrar.handleTokenRefresh(token)
