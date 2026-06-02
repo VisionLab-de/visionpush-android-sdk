@@ -5,6 +5,8 @@
  * Dependencies: Firebase Cloud Messaging, WorkManager, OkHttp 4, Kotlin Coroutines.
  */
 
+import java.net.URI
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
@@ -106,7 +108,9 @@ tasks.withType<org.jetbrains.dokka.gradle.DokkaTask>().configureEach {
             includes.from("Module.md")
             sourceLink {
                 localDirectory.set(file("src/main/kotlin"))
-                remoteUrl.set(java.net.URL("https://github.com/visionlab-de/visionpush/tree/main/sdks/android/src/main/kotlin"))
+                // URL(String) is deprecated since JDK 20; build via URI (imported
+                // at the top) and convert. Avoids the deprecated URL constructor.
+                remoteUrl.set(URI("https://github.com/visionlab-de/visionpush/tree/main/sdks/android/src/main/kotlin").toURL())
                 remoteLineSuffix.set("#L")
             }
         }
