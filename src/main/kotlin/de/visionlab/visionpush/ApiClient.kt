@@ -213,6 +213,53 @@ internal class ApiClient(
             body = JSONObject().apply { put("app_id", appId); put("device_id", deviceId) }
         ).map { }
 
+    /**
+     * Pushes the device's current coordinates and returns the nearest active geofences
+     * for on-device region monitoring. Calls `PUT /devices/{id}/location`; the backend
+     * persists the location and replies with `{"geofences": [...]}`.
+     * Mirrors the iOS SDK's `updateDeviceLocation`.
+     */
+    suspend fun updateDeviceLocation(
+        deviceId: String,
+        latitude: Double,
+        longitude: Double
+    ): VisionPushResult<List<GeofenceData>> {
+        val body = JSONObject().apply {
+            put("latitude", latitude)
+            put("longitude", longitude)
+        }
+        return put(path = "/devices/$deviceId/location", body = body).map { response ->
+            val result = mutableListOf<GeofenceData>()
+            // Backend returns top-level {"geofences": [...]} (no `data` wrapper).
+            response.rawBody?.optJSONArray("geofences")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    result.add(GeofenceData.fromJson(arr.getJSONObject(i)))
+                }
+            }
+            result
+        }
+    }
+
+    /**
+     * Reports an on-device geofence transition (`entry` / `exit` / `dwell`) to
+     * `POST /devices/{id}/geofence-events`. Mirrors the iOS SDK's `reportGeofenceEvent`.
+     */
+    suspend fun reportGeofenceEvent(
+        deviceId: String,
+        geofenceId: String,
+        eventType: String,
+        latitude: Double?,
+        longitude: Double?
+    ): VisionPushResult<Unit> {
+        val body = JSONObject().apply {
+            put("geofence_id", geofenceId)
+            put("event_type", eventType)
+            if (latitude != null) put("latitude", latitude) else put("latitude", JSONObject.NULL)
+            if (longitude != null) put("longitude", longitude) else put("longitude", JSONObject.NULL)
+        }
+        return post(path = "/devices/$deviceId/geofence-events", body = body).map { }
+    }
+
     // ── Internal HTTP helpers ───────────────────────────────────────────────
 
     private suspend fun post(path: String, body: JSONObject): VisionPushResult<ApiResponse> =
