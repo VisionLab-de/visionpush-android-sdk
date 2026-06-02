@@ -81,6 +81,12 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
 
+    // ── Google Play Services Location (geofencing + fused location) ───────────
+    // GeofenceManager/GeofenceEventWorker use com.google.android.gms.location.*
+    // (GeofencingClient, FusedLocationProviderClient, …). Without this dep the
+    // Kotlin compile fails with "Unresolved reference: GeofencingClient" etc.
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+
     // ── Core AndroidX ─────────────────────────────────────────────────────────
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")

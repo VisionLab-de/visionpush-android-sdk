@@ -431,6 +431,9 @@ data class ApiResponse(
     var rawData: JSONObject? = null
     /** The raw `data` array from the JSON response (when data is a JSON array). */
     var rawDataArray: org.json.JSONArray? = null
+    /** The full parsed response object — for endpoints that return top-level keys
+     *  (e.g. {"geofences": [...]}) rather than a `data` wrapper. */
+    var rawBody: JSONObject? = null
 
     companion object {
         fun fromJson(json: JSONObject): ApiResponse = ApiResponse(
@@ -440,6 +443,7 @@ data class ApiResponse(
         ).also {
             it.rawData = json.optJSONObject("data")
             it.rawDataArray = json.optJSONArray("data")
+            it.rawBody = json
         }
     }
 }
