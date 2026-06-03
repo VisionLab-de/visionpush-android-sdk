@@ -337,6 +337,39 @@ VisionPush.setNotificationOpenHandler { notification ->
 | `sentAt` | `String?` | ISO 8601 server send timestamp |
 | `showSystemNotification` | `Boolean` | `true` to post a system notification (default), `false` for silent delivery |
 
+### Realtime Delivery (owned transport)
+
+For low-latency delivery while your app is foregrounded, the SDK can open a
+persistent WebSocket to the VisionPush gateway. While connected, the device is
+**online** and pushes are delivered over the socket instead of FCM (no FCM quota
+used). Received pushes are forwarded to the **same** `setNotificationHandler`
+callback you already use for FCM, so no extra wiring is required.
+
+```kotlin
+// Open the realtime channel (call after the device has registered).
+VisionPush.setOnRegisteredListener { VisionPush.enableRealtime() }
+
+// Observe the connection state (optional).
+VisionPush.setRealtimeStatusHandler { state ->
+    Log.d("App", "Realtime: $state") // CONNECTING / OPEN / CLOSED
+}
+
+// Stop realtime; pushes resume over FCM.
+VisionPush.disableRealtime()
+```
+
+The channel authenticates with one frame, then auto-reconnects with exponential
+back-off + jitter on transient failures. Online delivery is best-effort /
+at-most-once (Phase 1); offline devices still receive pushes via FCM.
+
+| Member | Description |
+|---|---|
+| `enableRealtime(installationId? = null)` | Opens the realtime socket (uses the SDK installation ID by default) |
+| `disableRealtime()` | Closes the socket and stops reconnecting |
+| `realtimeState` | Current `RealtimeConnectionState` (`CONNECTING` / `OPEN` / `CLOSED`) |
+| `isRealtimeConnected` | `true` when authenticated and online |
+| `setRealtimeStatusHandler { state -> }` | Observe connection-state changes |
+
 ---
 
 ## Identifying Users
