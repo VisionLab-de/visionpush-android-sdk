@@ -2,11 +2,6 @@ package de.visionlab.visionpush
 
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
 
 /**
  * FCM service that handles incoming push messages and token rotation events.
@@ -41,15 +36,6 @@ import kotlinx.coroutines.launch
  */
 open class VisionPushMessagingService : FirebaseMessagingService() {
 
-    /**
-     * Coroutine scope tied to this service instance.
-     *
-     * [SupervisorJob] ensures that a failure in one child coroutine does not
-     * cancel the others. The scope is cancelled in [onDestroy] when the service
-     * lifecycle ends.
-     */
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-
     // ── FirebaseMessagingService overrides ──────────────────────────────────
 
     /**
@@ -70,24 +56,10 @@ open class VisionPushMessagingService : FirebaseMessagingService() {
         super.onMessageReceived(message)
         VisionPushLogger.d(TAG, "FCM message received. from=${message.from}")
 
-        // Decrypt a sealed push (Mode A/B) before parsing — the real content lives
-        // inside the opaque envelope. Pass-through + fail-closed for everything else.
-        val data = VisionPushSeal.unsealFcmData(message.data, sealedKeysProvider?.invoke())
-
-        val notification = VisionPushNotification.fromFcmData(data)
-        if (notification == null) {
-            VisionPushLogger.d(TAG, "Message does not contain a VisionPush payload – skipping.")
-            return
-        }
-
-        VisionPushLogger.i(TAG, "VisionPush notification received: id=${notification.id}")
-
-        // Store the notification for later retrieval by the open-tracking receiver
-        VisionPush.storeNotification(notification)
-
-        serviceScope.launch {
-            processNotification(notification)
-        }
+        // Unseal (Mode A/B) → parse → cache → dispatch, all via the shared pipeline
+        // so the FCM and HMS receive paths behave identically. Pass-through +
+        // fail-closed for non-VisionPush / undecryptable messages.
+        VisionPush.handleRemoteData(message.data, sealedKeysProvider?.invoke())
     }
 
     /**
@@ -105,61 +77,8 @@ open class VisionPushMessagingService : FirebaseMessagingService() {
      */
     override fun onNewToken(token: String) {
         super.onNewToken(token)
-        VisionPushLogger.i(TAG, "FCM token refreshed – re-registering device.")
-        serviceScope.launch {
-            val registrar = VisionPush.internalDeviceRegistrar
-            if (registrar == null) {
-                VisionPushLogger.w(
-                    TAG,
-                    "FCM token received before SDK init – scheduling sync for after initialize()."
-                )
-                // Schedule a WorkManager sync so the token is picked up once initialize() runs.
-                RegistrationSyncWorker.enqueue(applicationContext)
-                return@launch
-            }
-            registrar.handleTokenRefresh(token)
-                .onFailure { error ->
-                    VisionPushLogger.e(TAG, "Token refresh registration failed: ${error.message}")
-                    // Enqueue a WorkManager retry so the token eventually reaches the backend
-                    VisionPush.scheduleRegistrationSync(applicationContext)
-                }
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        serviceScope.cancel()
-    }
-
-    // ── Internal ────────────────────────────────────────────────────────────
-
-    /**
-     * Processes a received [VisionPushNotification].
-     *
-     * If the host app has registered a custom handler via
-     * [VisionPush.setNotificationHandler] and [notification.showSystemNotification]
-     * is `false`, the notification is forwarded to the handler only.
-     * Otherwise the SDK builds and posts a system notification.
-     */
-    private suspend fun processNotification(notification: VisionPushNotification) {
-        val customHandler = VisionPush.internalNotificationHandler
-
-        if (customHandler != null) {
-            VisionPushLogger.d(TAG, "Delegating notification to custom handler.")
-            customHandler(notification)
-        }
-
-        if (notification.showSystemNotification && VisionPush.foregroundNotificationEnabled) {
-            val builder = VisionPush.internalNotificationBuilder
-            if (builder != null) {
-                builder.show(notification)
-            } else {
-                VisionPushLogger.w(
-                    TAG,
-                    "SDK not initialized – cannot display system notification id=${notification.id}"
-                )
-            }
-        }
+        // Delegate to the shared token pipeline (re-register or schedule a sync).
+        VisionPush.handleNewToken(applicationContext, token)
     }
 
     // ── Companion ───────────────────────────────────────────────────────────

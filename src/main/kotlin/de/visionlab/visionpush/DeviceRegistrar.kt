@@ -138,7 +138,7 @@ internal class DeviceRegistrar(
         forceRefresh: Boolean = false,
         initialTags: Map<String, String> = emptyMap()
     ): VisionPushResult<String> {
-        val token = fetchFcmToken() ?: return VisionPushResult.Failure(
+        val token = fetchToken() ?: return VisionPushResult.Failure(
             VisionPushError.TokenUnavailable()
         )
 
@@ -213,6 +213,17 @@ internal class DeviceRegistrar(
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /**
+     * Resolves the current push token. When a [VisionPush.pushTokenProvider] is
+     * installed (e.g. by the Huawei SDK to return an HMS token) it is the sole
+     * source — no Firebase fallback, so a pure-HMS build never touches FCM. With
+     * no provider the SDK fetches the FCM token from Firebase ([fetchFcmToken]).
+     */
+    private suspend fun fetchToken(): String? {
+        val provider = VisionPush.pushTokenProvider
+        return if (provider != null) provider.invoke() else fetchFcmToken()
+    }
+
+    /**
      * Fetches the current FCM registration token, suspending until Firebase
      * resolves the Task. Returns `null` if Firebase is not configured or the
      * token cannot be obtained.
@@ -270,6 +281,7 @@ internal class DeviceRegistrar(
         return DeviceRegistration(
             appId = config.appId,
             pushToken = token,
+            platform = config.platform,
             externalId = externalId,
             installationId = anonymousId,
             anonymousId = anonymousId,

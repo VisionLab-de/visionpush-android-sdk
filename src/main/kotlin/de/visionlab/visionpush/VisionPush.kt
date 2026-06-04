@@ -172,6 +172,32 @@ object VisionPush {
      */
     @Volatile internal var foregroundNotificationEnabled = true
 
+    /**
+     * Overrides how the SDK obtains its push token during device registration.
+     *
+     * Left `null` (the default) the SDK fetches the **FCM** token from Firebase.
+     * The Huawei SDK (`VisionPushHms`) installs a provider here that returns the
+     * **HMS** Push token instead, before calling [initialize] — that is the only
+     * change needed to route a device through HMS instead of FCM. The provider is
+     * suspending (token fetch is a network/IPC call) and returns `null` when no
+     * token is available yet, in which case registration is retried via WorkManager.
+     */
+    @JvmStatic
+    @Volatile
+    var pushTokenProvider: (suspend () -> String?)? = null
+
+    /**
+     * This device's sealed-payload keys, or `null` before [initialize] runs.
+     *
+     * Exposed so the Huawei SDK's HMS messaging service — which lives in a separate
+     * Gradle module and therefore cannot reach the `internal` registrar the FCM
+     * service uses — can decrypt sealed pushes (Mode A/B). Wire it on the HMS
+     * service with `sealedKeysProvider = { VisionPush.sealedDeviceKeys }`.
+     */
+    @get:JvmStatic
+    val sealedDeviceKeys: VisionPushSeal.DeviceKeys?
+        get() = internalDeviceRegistrar?.sealedKeys
+
     // ── Initialization ──────────────────────────────────────────────────────
 
     /**
@@ -1348,6 +1374,86 @@ object VisionPush {
             if (notification.showSystemNotification && foregroundNotificationEnabled) {
                 internalNotificationBuilder?.show(notification)
             }
+        }
+    }
+
+    // ── Inbound push pipeline (shared by the FCM + HMS messaging services) ────
+
+    /**
+     * Processes an inbound push data map from a platform messaging service —
+     * [VisionPushMessagingService] (FCM) or `VisionPushHmsMessagingService` (HMS).
+     *
+     * Unseals a sealed payload (Mode A/B) with [sealedKeys], parses the VisionPush
+     * envelope (`vp_payload`), caches it for open-tracking and dispatches it to the
+     * custom handler and/or a system notification. This is the single source of
+     * truth for the FCM and HMS receive paths — both produce identical behaviour.
+     *
+     * @param data       Raw provider data map (FCM `RemoteMessage.data` /
+     *                   HMS `RemoteMessage.dataOfMap`).
+     * @param sealedKeys This device's sealed-payload keys, or `null` to skip unsealing
+     *                   (a sealed push then keeps its neutral placeholder — fail closed).
+     */
+    @JvmStatic
+    fun handleRemoteData(data: Map<String, String>, sealedKeys: VisionPushSeal.DeviceKeys? = null) {
+        val unsealed = VisionPushSeal.unsealFcmData(data, sealedKeys)
+        val notification = VisionPushNotification.fromFcmData(unsealed)
+        if (notification == null) {
+            VisionPushLogger.d(TAG, "Inbound message has no VisionPush payload – skipping.")
+            return
+        }
+        VisionPushLogger.i(TAG, "VisionPush notification received: id=${notification.id}")
+        storeNotification(notification)
+        sdkScope.launch { dispatchInboundNotification(notification) }
+    }
+
+    /** Dispatches a parsed notification to the custom handler and/or the system UI. */
+    private suspend fun dispatchInboundNotification(notification: VisionPushNotification) {
+        internalNotificationHandler?.let { handler ->
+            VisionPushLogger.d(TAG, "Delegating notification to custom handler.")
+            handler(notification)
+        }
+        if (notification.showSystemNotification && foregroundNotificationEnabled) {
+            val builder = internalNotificationBuilder
+            if (builder != null) {
+                builder.show(notification)
+            } else {
+                VisionPushLogger.w(
+                    TAG,
+                    "SDK not initialized – cannot display system notification id=${notification.id}"
+                )
+            }
+        }
+    }
+
+    /**
+     * Handles a refreshed push token from a platform messaging service (FCM or HMS).
+     *
+     * Re-registers the device immediately when the SDK is initialized; otherwise (or
+     * on network failure) schedules a WorkManager sync so the new token reaches the
+     * backend once [initialize] has run / connectivity returns.
+     *
+     * @param context A context (the messaging service's `applicationContext`).
+     * @param token   The new platform push token (FCM or HMS).
+     */
+    @JvmStatic
+    fun handleNewToken(context: Context, token: String) {
+        VisionPushLogger.i(TAG, "Push token refreshed – re-registering device.")
+        val appContext = context.applicationContext
+        sdkScope.launch {
+            val registrar = internalDeviceRegistrar
+            if (registrar == null) {
+                VisionPushLogger.w(
+                    TAG,
+                    "Token received before SDK init – scheduling sync for after initialize()."
+                )
+                RegistrationSyncWorker.enqueue(appContext)
+                return@launch
+            }
+            registrar.handleTokenRefresh(token)
+                .onFailure { error ->
+                    VisionPushLogger.e(TAG, "Token refresh registration failed: ${error.message}")
+                    scheduleRegistrationSync(appContext)
+                }
         }
     }
 

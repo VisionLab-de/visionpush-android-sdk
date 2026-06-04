@@ -49,7 +49,13 @@ data class VisionPushConfig(
     val apiKey: String,
     val apiBaseUrl: String = BuildConfig.VISIONPUSH_DEFAULT_API_BASE_URL,
     val logLevel: LogLevel = LogLevel.WARN,
-    val consentRequired: Boolean = false
+    val consentRequired: Boolean = false,
+    /**
+     * Push platform this device registers as: "android" (FCM, default) or
+     * "huawei" (HMS). The Huawei SDK ([VisionPushHms]) sets this to "huawei" so
+     * the backend routes via HMS Push Kit instead of FCM.
+     */
+    val platform: String = "android"
 ) {
     /** Supported log-verbosity levels, ordered from least to most verbose. */
     enum class LogLevel { NONE, ERROR, WARN, INFO, DEBUG, VERBOSE }
@@ -150,6 +156,9 @@ internal data class DeviceRegistration(
     val appId: String,
     /** Current FCM registration token. */
     val pushToken: String,
+    /** Push platform the [pushToken] belongs to: "android" (FCM) or "huawei" (HMS).
+     *  Determines which provider pool the server routes this device's pushes through. */
+    val platform: String,
     /** Caller-supplied external user identifier (nullable; cleared on logout). */
     val externalId: String?,
     /** SDK-generated stable UUID (generated on first launch, persisted in EncryptedSharedPreferences).
@@ -198,7 +207,7 @@ internal data class DeviceRegistration(
 ) : JsonSerializable {
     override fun toJson(): JSONObject = JSONObject().apply {
         put("app_id", appId)
-        put("platform", "android")
+        put("platform", platform)
         put("push_token", pushToken)
         put("environment", environment)
         externalId?.let { put("external_id", it) }
@@ -422,7 +431,9 @@ internal data class NotificationEvent(
         put("event_type", eventType.apiKey)
         put("action_id", actionId ?: JSONObject.NULL)
         put("occurred_at", occurredAt)
-        put("platform", "android")
+        // Mirror the registered push platform ("android" / "huawei") so event
+        // analytics stay consistent with how the device is routed.
+        put("platform", VisionPush.activeConfig?.platform ?: "android")
         campaignId?.let { put("campaign_id", it) }
         deviceId?.let { put("device_id", it) }
     }
