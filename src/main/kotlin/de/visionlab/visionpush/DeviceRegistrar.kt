@@ -98,7 +98,9 @@ internal class DeviceRegistrar(
      * can set [VisionPushMessagingService.sealedKeysProvider] for decryption.
      */
     internal val sealedKeys: VisionPushSeal.DeviceKeys
-        get() {
+        // Synchronized: accessed from both the main thread (registration) and the FCM
+        // background thread (sealedKeysProvider in onMessageReceived).
+        @Synchronized get() {
             prefs.getString(KEY_SEALED_KEYS, null)?.let { raw ->
                 try {
                     val o = org.json.JSONObject(raw)
