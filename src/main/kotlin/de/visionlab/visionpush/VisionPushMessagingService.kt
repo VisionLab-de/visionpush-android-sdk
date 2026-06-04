@@ -70,7 +70,11 @@ open class VisionPushMessagingService : FirebaseMessagingService() {
         super.onMessageReceived(message)
         VisionPushLogger.d(TAG, "FCM message received. from=${message.from}")
 
-        val notification = VisionPushNotification.fromFcmData(message.data)
+        // Decrypt a sealed push (Mode A/B) before parsing — the real content lives
+        // inside the opaque envelope. Pass-through + fail-closed for everything else.
+        val data = VisionPushSeal.unsealFcmData(message.data, sealedKeysProvider?.invoke())
+
+        val notification = VisionPushNotification.fromFcmData(data)
         if (notification == null) {
             VisionPushLogger.d(TAG, "Message does not contain a VisionPush payload – skipping.")
             return
@@ -162,5 +166,15 @@ open class VisionPushMessagingService : FirebaseMessagingService() {
 
     companion object {
         private const val TAG = "VP.MessagingService"
+
+        /**
+         * Supplies this device's sealed-payload keys so a sealed push (Mode A/B) can
+         * be decrypted in [onMessageReceived]. The host/SDK loads the keypair from
+         * the Android Keystore (EncryptedSharedPreferences) and sets this once. If
+         * unset or it returns null, sealed pushes keep their neutral placeholder
+         * content (fail closed — never the opaque envelope).
+         */
+        @JvmStatic
+        var sealedKeysProvider: (() -> VisionPushSeal.DeviceKeys?)? = null
     }
 }
