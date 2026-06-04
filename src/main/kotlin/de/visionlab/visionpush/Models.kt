@@ -188,7 +188,13 @@ internal data class DeviceRegistration(
     /** System notification permission: "granted" | "denied" | "unknown". */
     val notificationPermission: String? = null,
     /** Arbitrary key-value tags set by the integrating app (e.g. plan tier, feature flags). */
-    val tags: Map<String, String>? = null
+    val tags: Map<String, String>? = null,
+    /** App-layer sealed-payload public key (base64url) — lets the server seal content to this device. */
+    val sealedPubkey: String? = null,
+    /** Algorithm tag for [sealedPubkey] (e.g. "p256-aes128gcm-ece"). */
+    val sealedKeyAlg: String? = null,
+    /** Auth secret (base64url) paired with [sealedPubkey] (RFC 8291). */
+    val sealedAuth: String? = null
 ) : JsonSerializable {
     override fun toJson(): JSONObject = JSONObject().apply {
         put("app_id", appId)
@@ -212,6 +218,9 @@ internal data class DeviceRegistration(
         put("device_manufacturer", deviceManufacturer)
         networkType?.let { put("network_type", it) }
         notificationPermission?.let { put("notification_permission", it) }
+        sealedPubkey?.let { put("sealed_pubkey", it) }
+        sealedKeyAlg?.let { put("sealed_key_alg", it) }
+        sealedAuth?.let { put("sealed_auth", it) }
         tags?.takeIf { it.isNotEmpty() }?.let {
             put("tags", JSONObject().apply { it.forEach { (k, v) -> put(k, v) } })
         }

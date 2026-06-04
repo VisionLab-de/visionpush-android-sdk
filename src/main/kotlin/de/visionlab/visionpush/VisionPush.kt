@@ -91,6 +91,15 @@ object VisionPush {
     @Volatile internal var internalNotificationBuilder: NotificationBuilder? = null
     @Volatile internal var internalIamController: InAppMessageController? = null
 
+    /**
+     * Owned-transport realtime channel — created lazily by [enableRealtime] and
+     * torn down by [disableRealtime] / [logout].
+     */
+    @Volatile internal var internalRealtimeChannel: RealtimeChannel? = null
+
+    /** Optional observer for realtime connection-state changes (set via [setRealtimeStatusHandler]). */
+    @Volatile private var realtimeStatusHandler: ((RealtimeConnectionState) -> Unit)? = null
+
     /** Retained application context — set during [initialize], never null after that. */
     @Volatile private var applicationContext: Context? = null
 
@@ -268,6 +277,9 @@ object VisionPush {
 
             internalApiClient = apiClient
             internalDeviceRegistrar = registrar
+            // Let the FCM service (same process) decrypt sealed pushes with this
+            // device's keys (generated + persisted by the registrar).
+            VisionPushMessagingService.sealedKeysProvider = { registrar.sealedKeys }
             internalNotificationBuilder = notificationBuilder
             internalNotificationHandler = null
             internalNotificationOpenCallback = null
@@ -820,6 +832,8 @@ object VisionPush {
     @JvmOverloads
     fun logout(callback: ((VisionPushResult<Unit>) -> Unit)? = null) {
         checkInitialized()
+        // Tear down the realtime socket so a logged-out device stops receiving pushes.
+        disableRealtime()
         sdkScope.launch {
             internalNotificationHandler = null
             internalNotificationOpenCallback = null
@@ -1233,6 +1247,108 @@ object VisionPush {
     @MainThread
     fun triggerCustomEvent(eventName: String) {
         internalIamController?.triggerCustomEvent(eventName)
+    }
+
+    // ── Realtime (owned-transport WebSocket) ─────────────────────────────────
+
+    /**
+     * Opens the owned-transport realtime WebSocket to the VisionPush gateway.
+     *
+     * While the channel is connected this device is **ONLINE** and pushes are
+     * delivered over the persistent socket instead of FCM (no FCM quota used).
+     * Received pushes are forwarded to the same [setNotificationHandler] callback
+     * apps already use for FCM notifications, so no extra wiring is required.
+     *
+     * The channel auto-reconnects with exponential back-off + jitter on transient
+     * failures. Online delivery is best-effort / at-most-once (Phase 1).
+     *
+     * Calling this again while already enabled re-resolves the device identity and
+     * reconnects. No-op until the device has registered (an installation ID is
+     * required); use [setOnRegisteredListener] to know when registration completes.
+     *
+     * @param installationId Optional explicit device identifier. When omitted the
+     *   SDK's own installation ID (the same one used for device registration) is used.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun enableRealtime(installationId: String? = null) {
+        checkInitialized()
+        checkConsent()
+        val config = activeConfig ?: throw VisionPushError.NotInitialized()
+        val resolvedId = installationId?.takeIf { it.isNotBlank() }
+            ?: internalDeviceRegistrar?.anonymousId
+        if (resolvedId.isNullOrBlank()) {
+            VisionPushLogger.w(TAG, "enableRealtime() called before an installation ID is available – ignoring.")
+            return
+        }
+
+        // Tear down any prior channel so identity changes take effect.
+        internalRealtimeChannel?.disconnect()
+
+        val channel = RealtimeChannel(
+            baseUrl = config.apiBaseUrl,
+            apiKey = config.apiKey,
+            installationId = resolvedId,
+            appId = config.appId,
+            onPush = { payload, _ -> handleRealtimePush(payload) },
+            onStatusChange = { state ->
+                sdkScope.launch { realtimeStatusHandler?.invoke(state) }
+            }
+        )
+        internalRealtimeChannel = channel
+        channel.connect()
+        VisionPushLogger.i(TAG, "Realtime channel enabled.")
+    }
+
+    /**
+     * Closes the realtime channel and stops reconnect attempts. Pushes resume
+     * being delivered over FCM. Safe to call when realtime is disabled (no-op).
+     */
+    @JvmStatic
+    fun disableRealtime() {
+        internalRealtimeChannel?.disconnect()
+        internalRealtimeChannel = null
+        VisionPushLogger.i(TAG, "Realtime channel disabled.")
+    }
+
+    /** The current realtime connection state, or [RealtimeConnectionState.CLOSED] when disabled. */
+    @get:JvmStatic
+    val realtimeState: RealtimeConnectionState
+        get() = internalRealtimeChannel?.connectionState ?: RealtimeConnectionState.CLOSED
+
+    /** `true` when the realtime channel is connected and online. */
+    @get:JvmStatic
+    val isRealtimeConnected: Boolean
+        get() = internalRealtimeChannel?.isConnected ?: false
+
+    /**
+     * Registers a callback invoked when the realtime connection state changes.
+     * Invoked on the main thread. Pass `null` to clear the handler.
+     */
+    @JvmStatic
+    fun setRealtimeStatusHandler(handler: ((RealtimeConnectionState) -> Unit)?) {
+        realtimeStatusHandler = handler
+    }
+
+    /**
+     * Forwards a realtime push payload into the same notification pipeline used
+     * for FCM messages, so consumers see a single delivery API.
+     */
+    private fun handleRealtimePush(payload: org.json.JSONObject) {
+        val notification = try {
+            VisionPushNotification.fromJson(payload)
+        } catch (e: Exception) {
+            VisionPushLogger.w(TAG, "Dropping malformed realtime push payload: ${e.message}")
+            return
+        }
+        storeNotification(notification)
+        recordNotificationReceived(notification)
+        sdkScope.launch {
+            internalNotificationHandler?.invoke(notification)
+            if (notification.showSystemNotification && foregroundNotificationEnabled) {
+                internalNotificationBuilder?.show(notification)
+            }
+        }
     }
 
     // ── Badge Management ─────────────────────────────────────────────────────
