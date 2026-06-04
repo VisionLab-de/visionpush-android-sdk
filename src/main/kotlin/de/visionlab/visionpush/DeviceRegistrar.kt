@@ -91,6 +91,35 @@ internal class DeviceRegistrar(
             prefs.edit().putString(KEY_ANONYMOUS_ID, uuid).apply()
         }
 
+    /**
+     * The device's sealed-payload keys, generated + persisted in
+     * EncryptedSharedPreferences on first use. The base64url public parts are sent
+     * at registration; the private key never leaves the device. Exposed so the SDK
+     * can set [VisionPushMessagingService.sealedKeysProvider] for decryption.
+     */
+    internal val sealedKeys: VisionPushSeal.DeviceKeys
+        get() {
+            prefs.getString(KEY_SEALED_KEYS, null)?.let { raw ->
+                try {
+                    val o = org.json.JSONObject(raw)
+                    return VisionPushSeal.DeviceKeys(
+                        VisionPushSeal.b64urlDecode(o.getString("priv")),
+                        VisionPushSeal.b64urlDecode(o.getString("pub")),
+                        VisionPushSeal.b64urlDecode(o.getString("auth")),
+                    )
+                } catch (_: Exception) {
+                    // fall through and regenerate on corruption
+                }
+            }
+            val generated = VisionPushSeal.generateKeys()
+            val stored = org.json.JSONObject()
+                .put("priv", VisionPushSeal.b64urlEncode(generated.keys.privateKey))
+                .put("pub", generated.pubkeyB64)
+                .put("auth", generated.authB64)
+            prefs.edit().putString(KEY_SEALED_KEYS, stored.toString()).apply()
+            return generated.keys
+        }
+
     // ── Public operations ───────────────────────────────────────────────────
 
     /**
@@ -232,6 +261,10 @@ internal class DeviceRegistrar(
             else -> "phone"
         }
 
+        // Sealed-payload public key (generated + persisted on first use). Sent so the
+        // server can seal content to this device; the private key stays on-device.
+        val sealed = sealedKeys
+
         return DeviceRegistration(
             appId = config.appId,
             pushToken = token,
@@ -252,7 +285,10 @@ internal class DeviceRegistrar(
             deviceManufacturer = Build.MANUFACTURER,
             networkType = currentNetworkType(),
             notificationPermission = currentNotificationPermission(),
-            tags = tags.takeIf { it.isNotEmpty() }
+            tags = tags.takeIf { it.isNotEmpty() },
+            sealedPubkey = VisionPushSeal.b64urlEncode(sealed.publicKey),
+            sealedKeyAlg = VisionPushSeal.ALG,
+            sealedAuth = VisionPushSeal.b64urlEncode(sealed.auth),
         )
     }
 
@@ -298,5 +334,6 @@ internal class DeviceRegistrar(
         private const val KEY_OPTED_OUT = "opted_out"
         private const val KEY_LAST_STATE = "last_reg_state"
         private const val KEY_ANONYMOUS_ID = "anonymous_id"
+        private const val KEY_SEALED_KEYS = "sealed_keys"
     }
 }

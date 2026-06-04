@@ -277,6 +277,9 @@ object VisionPush {
 
             internalApiClient = apiClient
             internalDeviceRegistrar = registrar
+            // Let the FCM service (same process) decrypt sealed pushes with this
+            // device's keys (generated + persisted by the registrar).
+            VisionPushMessagingService.sealedKeysProvider = { registrar.sealedKeys }
             internalNotificationBuilder = notificationBuilder
             internalNotificationHandler = null
             internalNotificationOpenCallback = null
