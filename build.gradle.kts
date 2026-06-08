@@ -154,6 +154,13 @@ publishing {
                         email.set("sdk@visionpush.de")
                     }
                 }
+
+                // Required by Maven Central. Points at the public SDK mirror repo.
+                scm {
+                    url.set("https://github.com/VisionLab-de/visionpush-android-sdk")
+                    connection.set("scm:git:https://github.com/VisionLab-de/visionpush-android-sdk.git")
+                    developerConnection.set("scm:git:ssh://git@github.com/VisionLab-de/visionpush-android-sdk.git")
+                }
             }
         }
     }

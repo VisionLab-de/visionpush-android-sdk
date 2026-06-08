@@ -1,0 +1,10 @@
+# JitPack build configuration.
+# Android Gradle Plugin 8.2 / Kotlin 1.9 require JDK 17 — JitPack defaults to an
+# older JDK, so pin it here or the build fails before it starts.
+jdk:
+  - openjdk17
+
+# JitPack publishes the `release` Maven publication declared in build.gradle.kts
+# (artifact group is overridden to com.github.VisionLab-de on JitPack).
+install:
+  - ./gradlew clean assembleRelease publishReleasePublicationToMavenLocal -x test
