@@ -11,6 +11,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -137,7 +138,7 @@ class ApiClientTest {
         val interceptor = FakeInterceptor(listOf(200))
         val result = runBlocking { apiClient(interceptor).registerDevice(registration()) }
         assertTrue(result.isSuccess)
-        assertEquals("dev-xyz", (result as VisionPushResult.Success).data)
+        assertEquals("dev-xyz", (result as VisionPushResult.Success).data.deviceId)
         assertEquals(1, interceptor.calls.get())
     }
 
@@ -292,10 +293,15 @@ class ApiClientTest {
 
     @Test
     fun verificationFailure403IsNotRetriedAndSurfacesTheErrorCode() {
+        // The real shape (crates/visionpush-api/src/error.rs:177-182): the server
+        // ALWAYS nests {"error":{"code","message"}} — never a bare {"error":"<code>"}
+        // string. `code` is the generic "forbidden" category here (`ApiError::Forbidden`
+        // is a catch-all); the specific identifier is in `message`
+        // (services/identity.rs:62-64).
         // A 200 is queued behind the 403 — it must never be reached.
         val interceptor = FakeInterceptor(
             listOf(403, 200),
-            bodyJson = "{\"error\":\"external_id_verification_failed\"}",
+            bodyJson = "{\"error\":{\"code\":\"forbidden\",\"message\":\"external_id_verification_failed\"}}",
         )
         val result = runBlocking {
             apiClient(interceptor).registerDevice(registration().copy(externalId = "victim"))
@@ -303,9 +309,29 @@ class ApiClientTest {
         assertTrue(result.isFailure)
         val error = result.errorOrNull() as VisionPushError.ApiError
         assertEquals(403, error.httpStatus)
-        assertEquals("external_id_verification_failed", error.errorCode)
+        assertEquals("forbidden", error.errorCode)
+        assertEquals("external_id_verification_failed", error.message)
         assertTrue(error.isExternalIdVerificationFailed)
         assertEquals("a verification failure must not be retried", 1, interceptor.calls.get())
+    }
+
+    @Test
+    fun identityErased410IsRecognizedByItsOwnDedicatedCode() {
+        // Unlike external_id_verification_failed, this rejection DOES get its own code
+        // (`ApiError::IdentityErased` — error.rs:132-136), not the generic "forbidden".
+        val interceptor = FakeInterceptor(
+            listOf(410),
+            bodyJson = "{\"error\":{\"code\":\"identity_erased\",\"message\":\"This identity was erased.\"}}",
+        )
+        val result = runBlocking {
+            apiClient(interceptor).registerDevice(registration().copy(externalId = "erased-user"))
+        }
+        assertTrue(result.isFailure)
+        val error = result.errorOrNull() as VisionPushError.ApiError
+        assertEquals(410, error.httpStatus)
+        assertEquals("identity_erased", error.errorCode)
+        assertTrue(error.isIdentityErased)
+        assertEquals("a 410 must not be retried", 1, interceptor.calls.get())
     }
 
     @Test
@@ -394,5 +420,124 @@ class ApiClientTest {
         interceptor.sent.forEach { sent ->
             assertFalse(sent.headers.containsKey("X-VisionPush-Installation-Id"))
         }
+    }
+
+    // ── US-15 user model ──────────────────────────────────────────────────────
+
+    @Test
+    fun registerDevice_parsesTheUserIdFromTheResponse() {
+        val interceptor = FakeInterceptor(
+            listOf(200),
+            bodyJson = "{\"device_id\":\"dev-xyz\",\"is_new\":true,\"user_id\":\"user-abc\"}",
+        )
+        val result = runBlocking { apiClient(interceptor).registerDevice(registration()) }
+        val outcome = (result as VisionPushResult.Success).data
+        assertEquals("dev-xyz", outcome.deviceId)
+        assertEquals("user-abc", outcome.userId)
+    }
+
+    @Test
+    fun registerDevice_userIdIsNullWhenTheResponseOmitsIt() {
+        val interceptor = FakeInterceptor(listOf(200), bodyJson = "{\"device_id\":\"dev-xyz\"}")
+        val result = runBlocking { apiClient(interceptor).registerDevice(registration()) }
+        assertNull((result as VisionPushResult.Success).data.userId)
+    }
+
+    @Test
+    fun addUserAlias_sendsThePostWithLabelIdAndHash() {
+        val interceptor = FakeInterceptor(listOf(200))
+        val result = runBlocking { apiClient(interceptor).addUserAlias("dev-1", "loyalty_card", "LC-1", "ab".repeat(32)) }
+        assertTrue(result.isSuccess)
+        val s = interceptor.sent.single()
+        assertEquals("POST", s.method)
+        assertEquals("/v1/devices/dev-1/user/aliases", s.path)
+        val body = JSONObject(requireNotNull(s.body))
+        assertEquals("loyalty_card", body.getString("label"))
+        assertEquals("LC-1", body.getString("alias_id"))
+        assertEquals("ab".repeat(32), body.getString("alias_hash"))
+    }
+
+    @Test
+    fun removeUserAlias_sendsTheDeleteWithLabelIdAndHash() {
+        val interceptor = FakeInterceptor(listOf(200))
+        val result = runBlocking { apiClient(interceptor).removeUserAlias("dev-1", "loyalty_card", "LC-1", "ab".repeat(32)) }
+        assertTrue(result.isSuccess)
+        val s = interceptor.sent.single()
+        assertEquals("DELETE", s.method)
+        assertEquals("/v1/devices/dev-1/user/aliases", s.path)
+        val body = JSONObject(requireNotNull(s.body))
+        assertEquals("loyalty_card", body.getString("label"))
+        assertEquals("LC-1", body.getString("alias_id"))
+    }
+
+    @Test
+    fun addUserSubscription_sendsTypeAndToken() {
+        val interceptor = FakeInterceptor(listOf(201), bodyJson = "{\"subscription_id\":\"sub-1\"}")
+        val result = runBlocking { apiClient(interceptor).addUserSubscription("dev-1", "email", "user@example.com") }
+        assertTrue(result.isSuccess)
+        val s = interceptor.sent.single()
+        assertEquals("POST", s.method)
+        assertEquals("/v1/devices/dev-1/user/subscriptions", s.path)
+        val body = JSONObject(requireNotNull(s.body))
+        assertEquals("email", body.getString("type"))
+        assertEquals("user@example.com", body.getString("token"))
+    }
+
+    @Test
+    fun addUserSubscription_surfacesA409AsATypedConflictError() {
+        val interceptor = FakeInterceptor(
+            listOf(409),
+            bodyJson = "{\"error\":{\"code\":\"conflict\",\"message\":\"owned by another user\"}}",
+        )
+        val result = runBlocking { apiClient(interceptor).addUserSubscription("dev-1", "sms", "+4915123456789") }
+        assertTrue(result.isFailure)
+        val error = result.errorOrNull() as VisionPushError.ApiError
+        assertEquals(409, error.httpStatus)
+        assertTrue(error.isSubscriptionOwnedByAnotherUser)
+        assertEquals("a 409 must not be retried", 1, interceptor.calls.get())
+    }
+
+    @Test
+    fun updateDeviceTags_sendsAPatchToTheUserRouteNotTheDeviceRoute() {
+        val interceptor = FakeInterceptor(listOf(200))
+        val result = runBlocking { apiClient(interceptor).updateDeviceTags("dev-1", mapOf("plan" to "pro")) }
+        assertTrue(result.isSuccess)
+        val s = interceptor.sent.single()
+        assertEquals("PATCH", s.method)
+        assertEquals("/v1/devices/dev-1/user", s.path)
+        assertEquals("pro", JSONObject(requireNotNull(s.body)).getJSONObject("tags").getString("plan"))
+    }
+
+    @Test
+    fun getDeviceTags_readsTheFlatTagsObjectFromTheUserRouteNotADataEnvelope() {
+        // Real shape of GET /v1/devices/{id}/user (services/user.rs:633-640
+        // UserService::get_device_user): tags is a TOP-LEVEL key, not wrapped in
+        // {"data": {...}} — the old GET /v1/devices/{id} route this used to call (and
+        // which a client key cannot even read) never had the "data" shape either, so
+        // the previous decoding always returned an empty map.
+        val interceptor = FakeInterceptor(
+            listOf(200),
+            bodyJson = "{\"user_id\":\"user-1\",\"tags\":{\"plan\":\"pro\",\"level\":5}," +
+                "\"language\":\"de\",\"country\":\"DE\",\"aliases\":{},\"subscriptions\":[]}",
+        )
+        val result = runBlocking { apiClient(interceptor).getDeviceTags("dev-1") }
+        assertTrue(result.isSuccess)
+        val tags = (result as VisionPushResult.Success).data
+        assertEquals(mapOf("plan" to "pro", "level" to "5"), tags)
+        val s = interceptor.sent.single()
+        assertEquals("GET", s.method)
+        assertEquals("/v1/devices/dev-1/user", s.path)
+    }
+
+    @Test
+    fun removeDeviceTags_sendsAPatchToTheUserRouteNotTheDeviceRoute() {
+        val interceptor = FakeInterceptor(listOf(200))
+        val result = runBlocking { apiClient(interceptor).removeDeviceTags("dev-1", listOf("plan")) }
+        assertTrue(result.isSuccess)
+        val s = interceptor.sent.single()
+        assertEquals("PATCH", s.method)
+        assertEquals("/v1/devices/dev-1/user", s.path)
+        val arr = JSONObject(requireNotNull(s.body)).getJSONArray("tags_to_remove")
+        assertEquals("plan", arr.getString(0))
     }
 }

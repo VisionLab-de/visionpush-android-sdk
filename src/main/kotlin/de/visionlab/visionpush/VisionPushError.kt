@@ -52,9 +52,13 @@ sealed class VisionPushError(message: String, cause: Throwable? = null) :
      * The VisionPush API returned an error response.
      *
      * @property httpStatus HTTP status code returned by the server, or -1 if unknown.
-     * @property message    Human-readable error message from the server response body.
-     * @property errorCode  Machine-readable code from the body's `error` field (e.g.
-     *                      [EXTERNAL_ID_VERIFICATION_FAILED]), or `null` when absent.
+     * @property message    Human-readable error message from the body's `error.message`
+     *                      (e.g. [EXTERNAL_ID_VERIFICATION_FAILED] — some rejections put
+     *                      their specific, machine-readable identifier here rather than
+     *                      in [errorCode]; see [isExternalIdVerificationFailed]).
+     * @property errorCode  The body's `error.code` (e.g. [IDENTITY_ERASED] — but often a
+     *                      shared, generic category like `"forbidden"`/`"conflict"`), or
+     *                      `null` when absent.
      */
     class ApiError @JvmOverloads constructor(
         val httpStatus: Int,
@@ -67,17 +71,56 @@ sealed class VisionPushError(message: String, cause: Throwable? = null) :
          * identity verification is enabled for the app and the request that set
          * `external_id` carried no — or a wrong — `external_id_hash`.
          *
+         * The server answers this as `{"error":{"code":"forbidden","message":
+         * "external_id_verification_failed"}}` (`ApiError::Forbidden`, a catch-all whose
+         * `code` is the generic literal `"forbidden"` — the specific, machine-readable
+         * identifier lives in `message`, not `code`). Matching [message] is therefore the
+         * real check; [errorCode] is also compared for any future server revision that
+         * moves this identifier into its own dedicated code.
+         *
          * The rejection is deterministic, so the SDK never retries it. Fix: call
-         * [VisionPush.setExternalId] with the hash your backend computed (lowercase hex
+         * [VisionPush.login] with the hash your backend computed (lowercase hex
          * HMAC-SHA256 of the external id, keyed with the app's identity secret).
          */
         val isExternalIdVerificationFailed: Boolean
             get() = httpStatus == 403 &&
-                (errorCode == EXTERNAL_ID_VERIFICATION_FAILED || message.contains(EXTERNAL_ID_VERIFICATION_FAILED))
+                (errorCode == EXTERNAL_ID_VERIFICATION_FAILED || message == EXTERNAL_ID_VERIFICATION_FAILED)
+
+        /**
+         * `true` for the server's HTTP 409 on [VisionPush.addEmail] / [VisionPush.addSms] /
+         * [VisionPush.addAlias] (US-15): the address or alias already belongs to a
+         * DIFFERENT user — never silently taken over. Retrying with the same value
+         * will not succeed; surface it to the user instead (e.g. "already in use").
+         *
+         * The server answers this as `{"error":{"code":"conflict","message":"..."}}`
+         * (`ApiError::Conflict`, shared by several unrelated 409s) — `code` is generic
+         * here too, so [httpStatus] is the real (and only reliable) signal.
+         */
+        val isSubscriptionOwnedByAnotherUser: Boolean
+            get() = httpStatus == 409
+
+        /**
+         * `true` for the server's HTTP 410 `identity_erased` rejection
+         * ([VisionPush.login] naming an `externalId` whose person was erased under
+         * GDPR Art. 17): the server never recreates an erased identity from a login,
+         * only a server-side create (`POST /v1/apps/{app_id}/users`) can.
+         *
+         * Unlike [isExternalIdVerificationFailed], this rejection DOES get its own
+         * dedicated code — `{"error":{"code":"identity_erased","message":"..."}}`
+         * (`ApiError::IdentityErased`) — so [errorCode] is the real check.
+         *
+         * The rejection is deterministic: drop the cached external id locally rather
+         * than retrying the same login forever.
+         */
+        val isIdentityErased: Boolean
+            get() = httpStatus == 410 && errorCode == IDENTITY_ERASED
 
         companion object {
             /** Server error code for a rejected, unverified `external_id` (HTTP 403). */
             const val EXTERNAL_ID_VERIFICATION_FAILED = "external_id_verification_failed"
+
+            /** Server error code for a login naming an erased identity (HTTP 410). */
+            const val IDENTITY_ERASED = "identity_erased"
         }
     }
 
@@ -110,7 +153,7 @@ sealed class VisionPushError(message: String, cause: Throwable? = null) :
 
     /**
      * A method was called with an argument that violates the SDK's documented
-     * constraints (e.g. [VisionPush.setExternalId] called with a string longer
+     * constraints (e.g. [VisionPush.login] called with a string longer
      * than 1 024 characters).
      *
      * @property message Description of the specific constraint that was violated.

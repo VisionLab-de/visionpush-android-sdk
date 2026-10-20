@@ -51,9 +51,11 @@ import java.util.Collections
  * ## Identifying the logged-in user
  *
  * ```kotlin
- * VisionPush.setExternalId("user_123")
+ * VisionPush.login("user_123")
  * // With identity verification enabled for the app: pass the HMAC your backend computed
- * VisionPush.setExternalId("user_123", externalIdHash = hashFromYourBackend)
+ * VisionPush.login("user_123", externalIdHash = hashFromYourBackend)
+ * // After sign-out: hand the subscription to a new anonymous user
+ * VisionPush.logout()
  * ```
  *
  * ## Custom notification handling
@@ -97,13 +99,13 @@ object VisionPush {
 
     /**
      * On-device geofencing manager — created lazily by [enableGeofencing] and torn
-     * down by [disableGeofencing] / [logout]. Null until geofencing is enabled.
+     * down by [disableGeofencing] / [deleteDevice]. Null until geofencing is enabled.
      */
     @Volatile internal var internalGeofenceManager: GeofenceManager? = null
 
     /**
      * Owned-transport realtime channel — created lazily by [enableRealtime] and
-     * torn down by [disableRealtime] / [logout].
+     * torn down by [disableRealtime] / [deleteDevice].
      */
     @Volatile internal var internalRealtimeChannel: RealtimeChannel? = null
 
@@ -149,6 +151,14 @@ object VisionPush {
      * permanently (after WorkManager retries are exhausted). Set via [setOnRegistrationFailedListener].
      */
     @Volatile private var onRegistrationFailedCallback: ((error: Exception) -> Unit)? = null
+
+    /**
+     * Observer for the US-15 user this installation's subscription belongs to —
+     * fires on [login] and [logout] (and the deprecated [setExternalId] that
+     * delegates to them) whenever the server reports a different user id. Set via
+     * [setOnUserChangedListener].
+     */
+    @Volatile private var userChangeListener: ((userId: String?) -> Unit)? = null
 
     /**
      * Last line of defence for SDK background work: an uncaught throwable in a
@@ -351,6 +361,11 @@ object VisionPush {
             // initialize() is not a registration; the registrar publishes the
             // id the moment it mints one.
             apiClient.installationId = registrar.existingAnonymousId
+            // Forward every US-15 user-id change (login/logout, or the
+            // deprecated setExternalId that delegates to them) to the public
+            // listener. Posted through sdkScope → the main thread, like every
+            // other public callback.
+            registrar.onUserIdChanged = { newUserId -> sdkScope.launch { userChangeListener?.invoke(newUserId) } }
             val notificationBuilder = NotificationBuilder(appContext)
 
             internalApiClient = apiClient
@@ -392,6 +407,17 @@ object VisionPush {
         // Wire IAM OUTCOME button taps so an in-app message's "outcome" action records
         // a conversion via the same backend path as the public sendOutcome() API.
         internalIamController?.onOutcome = { name -> dispatchOutcome(name) }
+
+        // Wire click/dismiss recording for both the HTML bridge (US-16) and the native
+        // modal/banner/fullscreen types (SQ-290/SQ-285) — same backend path the
+        // impression tracker above already uses, just the click/dismiss event kinds the
+        // 0045 migration added. Read dynamically (dispatchIam*) rather than reassigned
+        // post-registration like onImpression above: a message can't be ingested/shown
+        // before registration completes anyway, so there's nothing to rewire.
+        internalIamController?.onHtmlClick = { message, buttonId -> dispatchIamClick(message.id, buttonId) }
+        internalIamController?.onHtmlDismiss = { message -> dispatchIamDismiss(message.id) }
+        internalIamController?.onNativeClick = { message, buttonId -> dispatchIamClick(message.id, buttonId) }
+        internalIamController?.onNativeDismiss = { message -> dispatchIamDismiss(message.id) }
 
         // Initial device registration – failures schedule a WorkManager retry
         sdkScope.launch {
@@ -528,20 +554,31 @@ object VisionPush {
         }
     }
 
-    // ── User identification ─────────────────────────────────────────────────
+    // ── User identity (US-15) ───────────────────────────────────────────────
+    //
+    // A real user object: aliases (external_id is a reserved one), email/SMS
+    // subscriptions and user-level properties (tags/language/country). An
+    // anonymous user is created at first registration; login() attaches an
+    // external id to it (or hands the subscription to the existing user that
+    // already owns that id); logout() hands it to a brand-new anonymous
+    // user. See the US-15 story contract for the full server-side semantics —
+    // this SDK is a thin, validated wrapper over
+    // `PUT /v1/devices/{id}` (login/logout via external_id/clear_external_id),
+    // `PATCH /v1/devices/{id}/user` (tags/language/country — see updateTags/removeTags),
+    // `POST|DELETE /v1/devices/{id}/user/aliases` (addAlias/removeAlias) and
+    // `POST /v1/devices/{id}/user/subscriptions` (addEmail/addSms).
 
     /**
-     * Associates the VisionPush device record with an external user identifier
-     * from your own system (e.g. your database user ID or CRM identifier).
+     * Associates this installation with [externalId] from your own system (e.g.
+     * your database user ID or CRM identifier) — OneSignal v5 `login()`.
      *
-     * Setting the same value again is idempotent. Pass `null` to clear the
-     * association (e.g. after logout; also consider calling [logout]).
-     *
-     * Clearing is an explicit backend operation: the device upsert treats an omitted
-     * `external_id` as "unchanged", so `null` sends `PUT /devices/{id}
-     * {"clear_external_id": true}` before re-registering. If that call fails (offline)
-     * the clear stays pending locally and is retried on the next registration sync —
-     * the device never silently keeps the previous user's id.
+     * If another user already owns [externalId], this installation's subscription
+     * moves to THAT user (its own anonymous user, with its tags, is discarded).
+     * Otherwise the id is assigned to this installation's current anonymous user.
+     * Setting the same ([externalId], [externalIdHash]) pair again is idempotent
+     * (no network call). The call is asynchronous; [userId] reflects the server's
+     * answer once it completes, and [setOnUserChangedListener] fires if the user
+     * actually changed.
      *
      * ## Identity verification
      *
@@ -560,15 +597,100 @@ object VisionPush {
      * reports the failure through [callback] and [onError]. With verification disabled
      * the hash is ignored, so it is always safe to pass one.
      *
-     * @param externalId     Opaque string, or `null` to clear.
+     * @param externalId     Opaque string identifying the user in your own system.
      * @param externalIdHash The backend-computed identity-verification hash for
      *                       [externalId] (64 hex characters; upper-case input is
-     *                       normalised). Ignored when [externalId] is `null`.
-     * @param callback       Optional result callback invoked on the main thread once the
-     *                       identity has been pushed to the backend.
-     * @throws VisionPushError.InvalidArgument for an id over 1 024 characters or a hash
-     *         that is not 64 hex characters.
+     *                       normalised).
+     * @param callback       Optional result callback invoked on the main thread with
+     *                       the [userId] this installation belongs to once the login
+     *                       has been pushed to the backend.
+     * @throws VisionPushError.InvalidArgument for a blank id, an id over 1 024
+     *         characters, or a hash that is not 64 hex characters.
      */
+    @JvmStatic
+    @JvmOverloads
+    fun login(
+        externalId: String,
+        externalIdHash: String? = null,
+        callback: ((VisionPushResult<String?>) -> Unit)? = null
+    ) {
+        if (externalId.isBlank()) {
+            throw VisionPushError.InvalidArgument("externalId must not be blank.")
+        }
+        if (externalId.length > 1_024) {
+            throw VisionPushError.InvalidArgument("externalId must be 1 024 characters or fewer.")
+        }
+        val hash = normalizeExternalIdHash(externalIdHash)
+        checkInitialized()
+        checkConsent()
+        val registrar = internalDeviceRegistrar ?: return
+        if (registrar.externalId == externalId && registrar.externalIdHash == hash) {
+            callback?.invoke(VisionPushResult.Success(registrar.userId))
+            return
+        }
+
+        VisionPushLogger.i(
+            TAG,
+            if (hash != null) "Logging in: $externalId (with identity hash)" else "Logging in: $externalId"
+        )
+
+        // updateExternalIdentity() persists id + hash, then register() flushes a pending
+        // clear (explicit PUT) before the upsert that carries them and reports userId.
+        sdkScope.launch {
+            val result = registrar.updateExternalIdentity(externalId, hash).map { registrar.userId }
+            withContext(Dispatchers.Main) {
+                result.onFailure { error -> errorHandler?.invoke(error) }
+                callback?.invoke(result)
+            }
+        }
+    }
+
+    /**
+     * Detaches the current external identity from this installation — OneSignal v5
+     * `logout()`: the subscription moves to a BRAND-NEW anonymous user; the previous
+     * (identified) user keeps its aliases and other subscriptions untouched. Already
+     * anonymous is idempotent (no network call). Asynchronous; [userId] reflects the
+     * new anonymous user once it completes, and [setOnUserChangedListener] fires.
+     *
+     * Distinct from [deleteDevice]: that call fully UNREGISTERS the device from push
+     * and resets the SDK to the un-initialized state. This call keeps the device
+     * registered and receiving push — it only detaches the signed-in user.
+     *
+     * @param callback Optional result callback invoked on the main thread with the
+     *                 new anonymous [userId].
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun logout(callback: ((VisionPushResult<String?>) -> Unit)? = null) {
+        checkInitialized()
+        checkConsent()
+        val registrar = internalDeviceRegistrar ?: return
+        if (registrar.externalId == null && !registrar.isExternalIdClearPending) {
+            callback?.invoke(VisionPushResult.Success(registrar.userId))
+            return
+        }
+
+        VisionPushLogger.i(TAG, "Logging out the current user.")
+
+        sdkScope.launch {
+            val result = registrar.updateExternalIdentity(null, null).map { registrar.userId }
+            withContext(Dispatchers.Main) {
+                result.onFailure { error -> errorHandler?.invoke(error) }
+                callback?.invoke(result)
+            }
+        }
+    }
+
+    /**
+     * @deprecated Use [login] to associate an id, or [logout] to clear it — the
+     * OneSignal v5 names for the same operation. Kept for source compatibility;
+     * delegates to them (a non-null [externalId] calls [login], `null` calls
+     * [logout]) and keeps the exact same validation and idempotency behaviour.
+     */
+    @Deprecated(
+        "Use login(externalId, externalIdHash) to associate an id, or logout() to clear it.",
+        ReplaceWith("login(externalId, externalIdHash, callback)")
+    )
     @JvmStatic
     @JvmOverloads
     fun setExternalId(
@@ -576,36 +698,10 @@ object VisionPush {
         externalIdHash: String? = null,
         callback: ((VisionPushResult<Unit>) -> Unit)? = null
     ) {
-        if (externalId != null && externalId.length > 1_024) {
-            throw VisionPushError.InvalidArgument("externalId must be 1 024 characters or fewer.")
-        }
-        // A hash without an id is meaningless (clearing never needs one) — don't even validate it.
-        val hash = if (externalId == null) null else normalizeExternalIdHash(externalIdHash)
-        checkInitialized()
-        checkConsent()
-        val registrar = internalDeviceRegistrar ?: return
-        if (registrar.externalId == externalId && registrar.externalIdHash == hash) {
-            callback?.invoke(VisionPushResult.Success(Unit))
-            return
-        }
-
-        VisionPushLogger.i(
-            TAG,
-            when {
-                externalId == null -> "External ID cleared."
-                hash != null -> "External ID updated: $externalId (with identity hash)"
-                else -> "External ID updated: $externalId"
-            }
-        )
-
-        // updateExternalIdentity() persists id + hash, then register() flushes a pending
-        // clear (explicit PUT) before the upsert that carries them.
-        sdkScope.launch {
-            val result = registrar.updateExternalIdentity(externalId, hash).map { }
-            withContext(Dispatchers.Main) {
-                result.onFailure { error -> errorHandler?.invoke(error) }
-                callback?.invoke(result)
-            }
+        if (externalId == null) {
+            logout { result -> callback?.invoke(result.map { }) }
+        } else {
+            login(externalId, externalIdHash) { result -> callback?.invoke(result.map { }) }
         }
     }
 
@@ -632,6 +728,202 @@ object VisionPush {
     /** The currently configured external user identifier, or `null` before it is set. */
     @get:JvmStatic
     val externalId: String? get() = internalDeviceRegistrar?.externalId
+
+    /**
+     * The US-15 user id this installation's subscription currently belongs to —
+     * anonymous until [login], and freshly re-assigned after [logout]. `null`
+     * before the first successful registration.
+     */
+    @get:JvmStatic
+    val userId: String? get() = internalDeviceRegistrar?.userId
+
+    /**
+     * Registers a callback invoked on the main thread whenever the [userId] this
+     * installation belongs to changes — after [login], [logout], or the
+     * deprecated [setExternalId] that delegates to them. Pass `null` to clear.
+     */
+    @JvmStatic
+    fun setOnUserChangedListener(listener: ((userId: String?) -> Unit)?) {
+        userChangeListener = listener
+    }
+
+    private val ALIAS_LABEL_PATTERN = Regex("[a-z0-9_]{1,64}")
+
+    /** Shared by [addAlias] and [removeAlias] — mirrors the server's `validate_custom_alias`. */
+    private fun validateAliasLabel(label: String) {
+        if (!ALIAS_LABEL_PATTERN.matches(label)) {
+            throw VisionPushError.InvalidArgument("label must match ^[a-z0-9_]{1,64}\$.")
+        }
+        if (label == "external_id" || label == "onesignal_id") {
+            throw VisionPushError.InvalidArgument(
+                "label '$label' is reserved — use login()/logout() for external_id."
+            )
+        }
+    }
+
+    /**
+     * Adds a custom alias to the user this installation belongs to — a second
+     * namespace alongside [login]'s external id (e.g. a loyalty-card number).
+     *
+     * [aliasHash] is required: the lowercase hex HMAC-SHA256 of `"$label:$id"`,
+     * keyed with the app's identity secret — computed by your backend, exactly
+     * like [login]'s `externalIdHash`. An app without an identity secret gets a
+     * 403 [VisionPushError.ApiError]; an alias already owned by a different user
+     * gets a 409 ([VisionPushError.ApiError.isSubscriptionOwnedByAnotherUser]).
+     *
+     * @param label     Custom alias namespace, `^[a-z0-9_]{1,64}$`. `external_id`
+     *                  and `onesignal_id` are reserved — use [login] instead.
+     * @param id        The alias value in that namespace (1–512 characters).
+     * @param aliasHash Backend-computed hex HMAC-SHA256 of `"label:id"`.
+     * @param callback  Optional result callback invoked on the main thread.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun addAlias(
+        label: String,
+        id: String,
+        aliasHash: String,
+        callback: ((VisionPushResult<Unit>) -> Unit)? = null
+    ) {
+        validateAliasLabel(label)
+        if (id.isBlank() || id.length > 512) {
+            throw VisionPushError.InvalidArgument("id must be 1–512 characters.")
+        }
+        val hash = normalizeExternalIdHash(aliasHash)
+            ?: throw VisionPushError.InvalidArgument(
+                "aliasHash must be the 64-character lowercase hex HMAC-SHA256 of \"$label:$id\", computed by your backend."
+            )
+        checkInitialized()
+        checkConsent()
+        sdkScope.launch {
+            val deviceId = internalDeviceRegistrar?.deviceId
+            val result = if (deviceId != null) {
+                internalApiClient?.addUserAlias(deviceId, label, id, hash)
+                    ?: VisionPushResult.Failure(VisionPushError.NotInitialized())
+            } else {
+                VisionPushResult.Failure(VisionPushError.TokenUnavailable("Device not yet registered."))
+            }
+            withContext(Dispatchers.Main) {
+                result.onFailure { error -> errorHandler?.invoke(error) }
+                callback?.invoke(result)
+            }
+        }
+    }
+
+    /**
+     * Removes a custom alias from the user this installation belongs to. Needs the
+     * same signed proof as [addAlias] — the server verifies [aliasHash] against
+     * `"label:id"` before removing it.
+     *
+     * @param label     The alias namespace to remove, as passed to [addAlias].
+     * @param id        The alias value, as passed to [addAlias].
+     * @param aliasHash Backend-computed hex HMAC-SHA256 of `"label:id"`.
+     * @param callback  Optional result callback invoked on the main thread.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun removeAlias(
+        label: String,
+        id: String,
+        aliasHash: String,
+        callback: ((VisionPushResult<Unit>) -> Unit)? = null
+    ) {
+        validateAliasLabel(label)
+        if (id.isBlank() || id.length > 512) {
+            throw VisionPushError.InvalidArgument("id must be 1–512 characters.")
+        }
+        val hash = normalizeExternalIdHash(aliasHash)
+            ?: throw VisionPushError.InvalidArgument(
+                "aliasHash must be the 64-character lowercase hex HMAC-SHA256 of \"$label:$id\", computed by your backend."
+            )
+        checkInitialized()
+        checkConsent()
+        sdkScope.launch {
+            val deviceId = internalDeviceRegistrar?.deviceId
+            val result = if (deviceId != null) {
+                internalApiClient?.removeUserAlias(deviceId, label, id, hash)
+                    ?: VisionPushResult.Failure(VisionPushError.NotInitialized())
+            } else {
+                VisionPushResult.Failure(VisionPushError.TokenUnavailable("Device not yet registered."))
+            }
+            withContext(Dispatchers.Main) {
+                result.onFailure { error -> errorHandler?.invoke(error) }
+                callback?.invoke(result)
+            }
+        }
+    }
+
+    private val EMAIL_PATTERN = Regex("[^\\s@]+@[^\\s@]+\\.[^\\s@]+")
+    private val E164_PATTERN = Regex("\\+[1-9]\\d{1,14}")
+
+    /**
+     * Adds an email subscription to the user this installation belongs to — so the
+     * same person can also be reached on the email channel. Validated locally (a
+     * syntactically valid address) before the request; the server lower-cases and
+     * trims it too. An address already owned by a DIFFERENT user is rejected with
+     * a 409 [VisionPushError.ApiError] ([VisionPushError.ApiError.isSubscriptionOwnedByAnotherUser]).
+     *
+     * @param email    The address to subscribe.
+     * @param callback Optional result callback invoked on the main thread.
+     * @throws VisionPushError.InvalidArgument if [email] is not a syntactically valid address.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun addEmail(email: String, callback: ((VisionPushResult<Unit>) -> Unit)? = null) {
+        val trimmed = email.trim()
+        if (!EMAIL_PATTERN.matches(trimmed)) {
+            throw VisionPushError.InvalidArgument("email must be a syntactically valid email address.")
+        }
+        checkInitialized()
+        checkConsent()
+        sdkScope.launch {
+            val deviceId = internalDeviceRegistrar?.deviceId
+            val result = if (deviceId != null) {
+                internalApiClient?.addUserSubscription(deviceId, "email", trimmed.lowercase())
+                    ?: VisionPushResult.Failure(VisionPushError.NotInitialized())
+            } else {
+                VisionPushResult.Failure(VisionPushError.TokenUnavailable("Device not yet registered."))
+            }
+            withContext(Dispatchers.Main) {
+                result.onFailure { error -> errorHandler?.invoke(error) }
+                callback?.invoke(result)
+            }
+        }
+    }
+
+    /**
+     * Adds an SMS subscription to the user this installation belongs to.
+     * [phoneE164] must already be in E.164 format (e.g. `"+4915123456789"`) — the
+     * SDK does not reformat local numbers. An address already owned by a DIFFERENT
+     * user is rejected with a 409 [VisionPushError.ApiError]
+     * ([VisionPushError.ApiError.isSubscriptionOwnedByAnotherUser]).
+     *
+     * @param phoneE164 The phone number to subscribe, in E.164 format.
+     * @param callback  Optional result callback invoked on the main thread.
+     * @throws VisionPushError.InvalidArgument if [phoneE164] is not valid E.164.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun addSms(phoneE164: String, callback: ((VisionPushResult<Unit>) -> Unit)? = null) {
+        if (!E164_PATTERN.matches(phoneE164)) {
+            throw VisionPushError.InvalidArgument("phoneE164 must be in E.164 format, e.g. \"+4915123456789\".")
+        }
+        checkInitialized()
+        checkConsent()
+        sdkScope.launch {
+            val deviceId = internalDeviceRegistrar?.deviceId
+            val result = if (deviceId != null) {
+                internalApiClient?.addUserSubscription(deviceId, "sms", phoneE164)
+                    ?: VisionPushResult.Failure(VisionPushError.NotInitialized())
+            } else {
+                VisionPushResult.Failure(VisionPushError.TokenUnavailable("Device not yet registered."))
+            }
+            withContext(Dispatchers.Main) {
+                result.onFailure { error -> errorHandler?.invoke(error) }
+                callback?.invoke(result)
+            }
+        }
+    }
 
     // ── Notification handlers ───────────────────────────────────────────────
 
@@ -676,7 +968,9 @@ object VisionPush {
     // ── Tags ────────────────────────────────────────────────────────────────
 
     /**
-     * Merges [tags] into the device record on the VisionPush backend.
+     * Merges [tags] into the user (US-15) this installation belongs to —
+     * mirrored onto every subscription of that user, so they survive a [login]
+     * to a different device just like in the OneSignal model.
      *
      * Keys and values must be ≤ 256 characters; maximum 100 pairs.
      * Existing tags are preserved unless overwritten by a matching key.
@@ -714,9 +1008,9 @@ object VisionPush {
     }
 
     /**
-     * Removes specific tag keys from this device on the VisionPush backend.
+     * Removes specific tag keys from the user (US-15) this installation belongs to.
      *
-     * Keys not present on the device are silently ignored. Maximum 100 keys,
+     * Keys not present on the user are silently ignored. Maximum 100 keys,
      * each key ≤ 256 characters.
      *
      * @param keys The tag keys to remove.
@@ -797,7 +1091,7 @@ object VisionPush {
      * Because [initialize] returns before registration completes (registration
      * is asynchronous and may be delayed by an unavailable FCM token or network),
      * use this listener to react to the registration completing — for example to
-     * retrieve [deviceId] or to call [setExternalId].
+     * retrieve [deviceId] or to call [login].
      *
      * ```kotlin
      * VisionPush.setOnRegisteredListener { deviceId ->
@@ -1016,7 +1310,7 @@ object VisionPush {
      * Removes all device registration data from the VisionPush backend and
      * clears all locally stored state. Call during user logout.
      *
-     * After calling [logout] the SDK returns to the un-initialized state, so a
+     * After calling [deleteDevice] the SDK returns to the un-initialized state, so a
      * subsequent [initialize] re-registers cleanly (e.g. when a different user
      * logs in). Calling [initialize] again is required to resume push delivery;
      * unlike before this fix, it is no longer a silent no-op.
@@ -1025,7 +1319,7 @@ object VisionPush {
      */
     @JvmStatic
     @JvmOverloads
-    fun logout(callback: ((VisionPushResult<Unit>) -> Unit)? = null) {
+    fun deleteDevice(callback: ((VisionPushResult<Unit>) -> Unit)? = null) {
         checkInitialized()
         // Tear down the realtime socket + geofencing so a logged-out device stops
         // receiving pushes and reporting location (disableRealtime also drops a
@@ -1052,6 +1346,7 @@ object VisionPush {
                 activeConfig = null
                 cachedTags = emptyMap()
                 cachedTopics = emptySet()
+                userChangeListener = null
                 initialized = false
             }
             VisionPushLogger.i(TAG, "User logged out; device unregistered. SDK reset – call initialize() to re-register.")
@@ -1919,6 +2214,44 @@ object VisionPush {
     }
 
     /**
+     * Fire-and-forget in-app-message click tracking — shared by the US-16 HTML
+     * bridge's `click(actionId, …)` ([InAppMessageController.onHtmlClick]) and a
+     * native modal/banner/fullscreen button tap ([InAppMessageController.onNativeClick],
+     * SQ-290). Both callers already guarantee at most one terminal event per display.
+     */
+    private fun dispatchIamClick(messageId: String, buttonId: String) {
+        sdkScope.launch {
+            val appId = activeConfig?.appId
+            val deviceId = internalDeviceRegistrar?.deviceId
+            if (appId == null || deviceId == null) {
+                VisionPushLogger.w(TAG, "IAM click on '$messageId' dropped – not yet initialized/registered.")
+                return@launch
+            }
+            internalApiClient?.trackIAMClick(appId, deviceId, messageId, buttonId)
+                ?.onFailure { error -> VisionPushLogger.w(TAG, "IAM click tracking failed: ${error.message}") }
+        }
+    }
+
+    /**
+     * Fire-and-forget in-app-message dismiss tracking — shared by the US-16 HTML
+     * bridge's `close()` ([InAppMessageController.onHtmlDismiss]) and a native
+     * modal/banner/fullscreen dismiss ([InAppMessageController.onNativeDismiss],
+     * SQ-290). Both callers already guarantee at most one terminal event per display.
+     */
+    private fun dispatchIamDismiss(messageId: String) {
+        sdkScope.launch {
+            val appId = activeConfig?.appId
+            val deviceId = internalDeviceRegistrar?.deviceId
+            if (appId == null || deviceId == null) {
+                VisionPushLogger.w(TAG, "IAM dismiss on '$messageId' dropped – not yet initialized/registered.")
+                return@launch
+            }
+            internalApiClient?.trackIAMDismiss(appId, deviceId, messageId)
+                ?.onFailure { error -> VisionPushLogger.w(TAG, "IAM dismiss tracking failed: ${error.message}") }
+        }
+    }
+
+    /**
      * Schedules a background device registration sync via WorkManager.
      * Called when an immediate registration attempt fails due to no network.
      */
@@ -1945,7 +2278,7 @@ object VisionPush {
 
     /**
      * Test-only: returns the singleton to its pristine, un-initialized state without
-     * any network I/O (unlike [logout]). Robolectric test classes share one sandbox
+     * any network I/O (unlike [deleteDevice]). Robolectric test classes share one sandbox
      * class loader, so a test that initializes the SDK must reset it in `@After`.
      */
     @VisibleForTesting
@@ -1964,6 +2297,7 @@ object VisionPush {
             errorHandler = null
             onRegisteredCallback = null
             onRegistrationFailedCallback = null
+            userChangeListener = null
             activeConfig = null
             cachedTags = emptyMap()
             cachedTopics = emptySet()

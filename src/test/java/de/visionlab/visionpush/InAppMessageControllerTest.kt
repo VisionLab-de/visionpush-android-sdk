@@ -2,6 +2,9 @@ package de.visionlab.visionpush
 
 import android.app.Activity
 import android.os.Looper
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Button
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -31,6 +34,8 @@ class InAppMessageControllerTest {
     private lateinit var controller: InAppMessageController
     private val impressions = mutableListOf<String>()
     private val dismissed = mutableListOf<String>()
+    private val nativeClicks = mutableListOf<Pair<String, String>>() // messageId to buttonId
+    private val nativeDismisses = mutableListOf<String>()
 
     @Before
     fun setup() {
@@ -38,6 +43,8 @@ class InAppMessageControllerTest {
         controller = InAppMessageController(app)
         controller.onImpression = { id -> impressions.add(id) }
         controller.onDismissed = { msg -> dismissed.add(msg.id) }
+        controller.onNativeClick = { msg, buttonId -> nativeClicks.add(msg.id to buttonId) }
+        controller.onNativeDismiss = { msg -> nativeDismisses.add(msg.id) }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -48,6 +55,8 @@ class InAppMessageControllerTest {
         eventName: String? = null,
         type: String = "modal",
         dismissAfterSeconds: Double? = null,
+        htmlBody: String? = null,
+        primaryButtonId: String? = null,
     ): InAppMessage {
         val trigger = JSONObject().apply {
             put("type", triggerType)
@@ -58,8 +67,26 @@ class InAppMessageControllerTest {
             put("type", type)
             put("triggers", JSONArray().apply { put(trigger) })
             if (dismissAfterSeconds != null) put("dismiss_after", dismissAfterSeconds)
+            if (htmlBody != null) put("html_body", htmlBody)
+            if (primaryButtonId != null) {
+                put("primary_button", JSONObject().apply {
+                    put("id", primaryButtonId)
+                    put("text", "Go")
+                })
+            }
         }
         return requireNotNull(InAppMessage.fromJson(json))
+    }
+
+    /** Depth-first search for the first [Button] whose text matches [text]. */
+    private fun findButtonWithText(root: View, text: String): Button? {
+        if (root is Button && root.text.toString() == text) return root
+        if (root is ViewGroup) {
+            for (i in 0 until root.childCount) {
+                findButtonWithText(root.getChildAt(i), text)?.let { return it }
+            }
+        }
+        return null
     }
 
     /** Creates a resumed activity and tells the controller it is in the foreground. */
@@ -357,5 +384,116 @@ class InAppMessageControllerTest {
         idle()
 
         assertTrue(impressions.isEmpty())
+    }
+
+    // ── HTML in-app messages (US-16) ──────────────────────────────────────────
+
+    @Test
+    fun triggerSession_htmlMessage_doesNotCountImpressionImmediately() {
+        resumeActivity()
+        controller.ingest(listOf(makeMessage("m1", "on_session", type = "html", htmlBody = "<p>hi</p>")))
+        controller.triggerSession()
+        idle()
+
+        // Unlike modal/banner, the HTML renderer counts its impression from the
+        // WebView's onPageFinished (see HtmlInAppMessageRendererTest) — not
+        // synchronously here just because the dialog is attached.
+        assertTrue(impressions.isEmpty())
+    }
+
+    @Test
+    fun triggerSession_htmlMessageWithoutHtmlBody_isDroppedRatherThanWedgingTheQueue() {
+        // The CHECK constraint (migration 0056) means a real server response can't
+        // omit html_body for type=html, but a malformed message must still free the
+        // slot — same "not shown" path presentModal/presentBanner already have.
+        resumeActivity()
+        controller.ingest(listOf(makeMessage("m1", "on_session", type = "html")))
+        controller.triggerSession()
+        idle()
+
+        assertTrue(impressions.isEmpty())
+        assertTrue(dismissed.isEmpty())
+        assertEquals(0, controller.queuedMessageCount)
+    }
+
+    // ── Native click/dismiss tracking (SQ-290) ────────────────────────────────
+
+    @Test
+    fun nativeBannerButtonTap_producesExactlyOneClickAndNoDismiss() {
+        val activity = resumeActivity()
+        controller.ingest(listOf(makeMessage("m1", "on_session", type = "banner", primaryButtonId = "cta")))
+        controller.triggerSession()
+        idle()
+
+        val content = activity.window.decorView.findViewById<View>(android.R.id.content)
+        val button = requireNotNull(findButtonWithText(content, "Go"))
+        button.performClick()
+        idle()
+
+        assertEquals(listOf("m1" to "cta"), nativeClicks)
+        assertTrue("a click is never also counted as a dismiss", nativeDismisses.isEmpty())
+    }
+
+    @Test
+    fun nativeBannerButtonTap_tappedTwice_recordsExactlyOneClick() {
+        // The banner's own dismiss-once guard removes it from the view tree after the
+        // first tap, so a genuine double-tap can't reach the listener again in
+        // practice — this exercises the controller-level guard directly instead.
+        val activity = resumeActivity()
+        controller.ingest(listOf(makeMessage("m1", "on_session", type = "banner", primaryButtonId = "cta")))
+        controller.triggerSession()
+        idle()
+
+        val content = activity.window.decorView.findViewById<View>(android.R.id.content)
+        val button = requireNotNull(findButtonWithText(content, "Go"))
+        button.performClick()
+        button.performClick()
+        idle()
+
+        assertEquals(1, nativeClicks.size)
+    }
+
+    @Test
+    fun nativeModalDismiss_withoutAClick_producesExactlyOneDismiss() {
+        resumeActivity()
+        controller.ingest(listOf(makeMessage("m1", "on_session")))
+        controller.triggerSession()
+        idle()
+
+        controller.dismissCurrent()
+        idle()
+
+        assertEquals(listOf("m1"), nativeDismisses)
+        assertTrue(nativeClicks.isEmpty())
+    }
+
+    @Test
+    fun nativeModalDismiss_calledRepeatedly_recordsExactlyOneDismiss() {
+        resumeActivity()
+        controller.ingest(listOf(makeMessage("m1", "on_session")))
+        controller.triggerSession()
+        idle()
+
+        controller.dismissCurrent()
+        controller.dismissCurrent() // nothing on screen any more — a no-op, not a second dismiss
+        idle()
+
+        assertEquals(listOf("m1"), nativeDismisses)
+    }
+
+    @Test
+    fun htmlMessageDismiss_doesNotAlsoFireNativeDismissTracking() {
+        // HTML tracks its own click/dismiss entirely through HtmlIamBridge (SQ-288);
+        // onNativeDismiss must stay silent for type=html so the event isn't counted twice.
+        resumeActivity()
+        controller.ingest(listOf(makeMessage("m1", "on_session", type = "html", htmlBody = "<p>hi</p>")))
+        controller.triggerSession()
+        idle()
+
+        controller.dismissCurrent()
+        idle()
+
+        assertTrue(nativeDismisses.isEmpty())
+        assertTrue(nativeClicks.isEmpty())
     }
 }

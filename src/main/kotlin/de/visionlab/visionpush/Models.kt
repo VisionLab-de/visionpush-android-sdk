@@ -447,7 +447,10 @@ internal data class NotificationEvent(
 data class ApiResponse(
     val success: Boolean,
     val message: String?,
-    val deviceId: String?
+    val deviceId: String?,
+    /** The user (US-15) this device's subscription belongs to — present on the
+     *  register response; `null` for endpoints that don't return it. */
+    val userId: String? = null
 ) {
     /** The raw `data` object from the JSON response (when data is a JSON object). */
     var rawData: JSONObject? = null
@@ -461,7 +464,8 @@ data class ApiResponse(
         fun fromJson(json: JSONObject): ApiResponse = ApiResponse(
             success = json.optBoolean("success", false),
             message = json.optString("message").takeIf { it.isNotBlank() },
-            deviceId = json.optString("device_id").takeIf { it.isNotBlank() }
+            deviceId = json.optString("device_id").takeIf { it.isNotBlank() },
+            userId = json.optString("user_id").takeIf { it.isNotBlank() }
         ).also {
             it.rawData = json.optJSONObject("data")
             it.rawDataArray = json.optJSONArray("data")
@@ -469,6 +473,14 @@ data class ApiResponse(
         }
     }
 }
+
+/**
+ * Outcome of [ApiClient.registerDevice]: the device id every caller already used,
+ * plus the US-15 user (anonymous or identified) the registration now reports —
+ * `null` only for a malformed response, never by design (the server always
+ * includes `user_id`).
+ */
+internal data class DeviceRegistrationOutcome(val deviceId: String, val userId: String?)
 
 // ── WorkManager input data keys ─────────────────────────────────────────────────
 

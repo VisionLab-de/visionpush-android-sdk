@@ -69,13 +69,38 @@ class VisionPushSDKTest {
 
     @Test
     fun inAppMessage_parsesAllTypes() {
-        listOf("modal" to IAMType.MODAL, "banner" to IAMType.BANNER, "fullscreen" to IAMType.FULLSCREEN)
-            .forEach { (raw, expected) ->
-                val json = JSONObject().apply {
-                    put("id", "m"); put("type", raw); put("triggers", org.json.JSONArray())
-                }
-                assertEquals(expected, InAppMessage.fromJson(json)?.type)
+        listOf(
+            "modal" to IAMType.MODAL,
+            "banner" to IAMType.BANNER,
+            "fullscreen" to IAMType.FULLSCREEN,
+            "html" to IAMType.HTML,
+        ).forEach { (raw, expected) ->
+            val json = JSONObject().apply {
+                put("id", "m"); put("type", raw); put("triggers", org.json.JSONArray())
             }
+            assertEquals(expected, InAppMessage.fromJson(json)?.type)
+        }
+    }
+
+    @Test
+    fun inAppMessage_parsesHtmlBody() {
+        val json = JSONObject().apply {
+            put("id", "h1")
+            put("type", "html")
+            put("html_body", "<p>Hello</p>")
+            put("triggers", org.json.JSONArray())
+        }
+        val msg = requireNotNull(InAppMessage.fromJson(json))
+        assertEquals(IAMType.HTML, msg.type)
+        assertEquals("<p>Hello</p>", msg.htmlBody)
+    }
+
+    @Test
+    fun inAppMessage_htmlBodyIsNullForNonHtmlTypes() {
+        val json = JSONObject().apply {
+            put("id", "m1"); put("type", "modal"); put("triggers", org.json.JSONArray())
+        }
+        assertNull(InAppMessage.fromJson(json)?.htmlBody)
     }
 
     @Test
@@ -735,6 +760,138 @@ class VisionPushSDKTest {
             fail("Expected VisionPushError.NotInitialized")
         } catch (e: VisionPushError.NotInitialized) {
             assertNotNull(e.message)
+        }
+    }
+
+    // ── User identity (US-15) input validation ─────────────────────────────
+
+    @Test
+    fun login_throwsInvalidArgumentForABlankExternalId() {
+        try {
+            VisionPush.login("   ")
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue(requireNotNull(e.message).isNotEmpty())
+        }
+    }
+
+    @Test
+    fun login_throwsInvalidArgumentWhenTooLong() {
+        try {
+            VisionPush.login("a".repeat(1025))
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue(requireNotNull(e.message).isNotEmpty())
+        }
+    }
+
+    @Test
+    fun login_rejectsAMalformedHashBeforeAnythingElse() {
+        try {
+            VisionPush.login("user", "not-a-hash")
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue("the message must say what the hash is", requireNotNull(e.message).contains("HMAC-SHA256"))
+        }
+    }
+
+    @Test
+    fun login_throwsNotInitializedOnceValidationPasses() {
+        try {
+            VisionPush.login("user-1")
+            fail("Expected VisionPushError.NotInitialized")
+        } catch (e: VisionPushError.NotInitialized) {
+            // correct: validation passed, SDK not initialized
+        }
+    }
+
+    @Test
+    fun logout_throwsWhenNotInitialized() {
+        try {
+            VisionPush.logout()
+            fail("Expected VisionPushError.NotInitialized")
+        } catch (e: VisionPushError.NotInitialized) {
+            assertNotNull(e.message)
+        }
+    }
+
+    @Test
+    fun addAlias_throwsInvalidArgumentForAMalformedLabel() {
+        try {
+            VisionPush.addAlias("Not Valid!", "lc-1", "ab".repeat(32))
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue(requireNotNull(e.message).contains("label"))
+        }
+    }
+
+    @Test
+    fun addAlias_throwsInvalidArgumentForTheReservedExternalIdLabel() {
+        try {
+            VisionPush.addAlias("external_id", "u1", "ab".repeat(32))
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue(requireNotNull(e.message).contains("reserved"))
+        }
+    }
+
+    @Test
+    fun addAlias_throwsInvalidArgumentForAMalformedAliasHash() {
+        try {
+            VisionPush.addAlias("loyalty_card", "lc-1", "not-a-hash")
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue(requireNotNull(e.message).contains("HMAC-SHA256"))
+        }
+    }
+
+    @Test
+    fun removeAlias_throwsInvalidArgumentForTheReservedOnesignalIdLabel() {
+        try {
+            VisionPush.removeAlias("onesignal_id", "u1", "ab".repeat(32))
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue(requireNotNull(e.message).contains("reserved"))
+        }
+    }
+
+    @Test
+    fun addEmail_throwsInvalidArgumentForAMalformedAddress() {
+        try {
+            VisionPush.addEmail("not-an-email")
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue(requireNotNull(e.message).contains("email"))
+        }
+    }
+
+    @Test
+    fun addEmail_throwsNotInitializedForAValidAddress() {
+        try {
+            VisionPush.addEmail("user@example.com")
+            fail("Expected VisionPushError.NotInitialized")
+        } catch (e: VisionPushError.NotInitialized) {
+            // correct: validation passed, SDK not initialized
+        }
+    }
+
+    @Test
+    fun addSms_throwsInvalidArgumentForANonE164Number() {
+        try {
+            VisionPush.addSms("015123456789")
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue(requireNotNull(e.message).contains("E.164"))
+        }
+    }
+
+    @Test
+    fun addSms_throwsNotInitializedForAValidE164Number() {
+        try {
+            VisionPush.addSms("+4915123456789")
+            fail("Expected VisionPushError.NotInitialized")
+        } catch (e: VisionPushError.NotInitialized) {
+            // correct: validation passed, SDK not initialized
         }
     }
 }

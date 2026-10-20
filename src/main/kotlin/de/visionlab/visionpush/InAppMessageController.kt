@@ -22,6 +22,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 
 // MARK: - Models
 
@@ -38,7 +39,10 @@ data class InAppMessage(
     val triggers: List<IAMTrigger>,
     val backgroundColor: String?,
     val textColor: String?,
-    val campaignId: String?
+    val campaignId: String?,
+    /** `type = "html"` only (US-16 / migration 0056). Raw HTML rendered by
+     *  [HtmlInAppMessageRenderer]; `null` for every other type. */
+    val htmlBody: String?
 ) {
     companion object {
         fun fromJson(json: JSONObject): InAppMessage? {
@@ -64,19 +68,21 @@ data class InAppMessage(
                 triggers = triggers,
                 backgroundColor = json.optString("background_color").takeIf { it.isNotEmpty() },
                 textColor = json.optString("text_color").takeIf { it.isNotEmpty() },
-                campaignId = json.optString("campaign_id").takeIf { it.isNotEmpty() }
+                campaignId = json.optString("campaign_id").takeIf { it.isNotEmpty() },
+                htmlBody = json.optString("html_body").takeIf { it.isNotEmpty() }
             )
         }
     }
 }
 
 enum class IAMType {
-    MODAL, BANNER, FULLSCREEN;
+    MODAL, BANNER, FULLSCREEN, HTML;
 
     companion object {
         fun fromString(s: String) = when (s.lowercase()) {
             "banner" -> BANNER
             "fullscreen" -> FULLSCREEN
+            "html" -> HTML
             else -> MODAL
         }
     }
@@ -190,6 +196,28 @@ class InAppMessageController(
     var onOutcome: ((String) -> Unit)? = null
     var onImpression: ((String) -> Unit)? = null
 
+    /** US-16: fired by the HTML bridge's `click(actionId, …)` — `buttonId` is the
+     *  action id the HTML content passed. Distinct from [onButtonTapped], which is
+     *  for the native modal/banner's admin-defined buttons, not free-form HTML. */
+    var onHtmlClick: ((InAppMessage, buttonId: String) -> Unit)? = null
+
+    /** US-16: fired only by the HTML bridge's `close()` — a click is never also
+     *  counted as a dismiss. [onDismissed] still fires for every closed message
+     *  (including an HTML click-then-close), same as it always has. */
+    var onHtmlDismiss: ((InAppMessage) -> Unit)? = null
+
+    /** SQ-290: fired when a native (modal/banner/fullscreen) message's admin-defined
+     *  button is tapped — `buttonId` is [IAMButton.id]. Backend click tracking,
+     *  distinct from the public [onButtonTapped], which an app can freely overwrite.
+     *  Fires at most once per display, same as [onHtmlClick] already does for HTML. */
+    var onNativeClick: ((InAppMessage, buttonId: String) -> Unit)? = null
+
+    /** SQ-290: fired when a native (modal/banner/fullscreen) message is dismissed
+     *  WITHOUT a preceding button tap — a click is never also counted as a dismiss.
+     *  Backend dismiss tracking, distinct from the public [onDismissed]. Fires at
+     *  most once per display, same as [onHtmlDismiss] already does for HTML. */
+    var onNativeDismiss: ((InAppMessage) -> Unit)? = null
+
     // MARK: - State
 
     /** Messages waiting for their trigger. */
@@ -201,6 +229,16 @@ class InAppMessageController(
     private var isPresenting = false
     private var foregroundActivity: Activity? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * Guards [onNativeClick]/[onNativeDismiss] so a native display reports at most one
+     * terminal event, same idempotency the HTML bridge enforces for itself (SQ-288).
+     * Reset per display in [present] right before it actually shows (never while
+     * another presentation is in flight — [isPresenting] keeps displays serialized).
+     * Not consulted for `type = "html"`: that path tracks entirely inside
+     * [HtmlIamBridge], whose own guard already makes this one redundant there.
+     */
+    private val nativeTerminalEventFired = AtomicBoolean(false)
 
     /** Dismisses whatever is currently on screen (set once a presentation succeeded). */
     private var currentDismissal: (() -> Unit)? = null
@@ -303,10 +341,14 @@ class InAppMessageController(
                 return@post
             }
 
+            // New display: this message hasn't reported a click or dismiss yet.
+            nativeTerminalEventFired.set(false)
+
             val shown = try {
                 when (message.type) {
                     IAMType.MODAL, IAMType.FULLSCREEN -> presentModal(activity, message)
                     IAMType.BANNER -> presentBanner(activity, message)
+                    IAMType.HTML -> presentHtml(activity, message)
                 }
             } catch (e: Exception) {
                 // e.g. WindowManager.BadTokenException when the activity is going away.
@@ -315,8 +357,11 @@ class InAppMessageController(
             }
 
             if (shown) {
-                // Billed only now — the message is actually on screen.
-                onImpression?.invoke(message.id)
+                // HTML counts its impression later, from the WebView's onPageFinished
+                // (presentHtml wires that itself) — firing it here too would double-count.
+                if (message.type != IAMType.HTML) {
+                    onImpression?.invoke(message.id)
+                }
             } else {
                 // Not shown: free the slot and drop the message rather than looping on a
                 // message that deterministically fails to present.
@@ -331,6 +376,12 @@ class InAppMessageController(
     private fun onPresentationEnded(message: InAppMessage) {
         currentDismissal = null
         isPresenting = false
+        // HTML already tracked its own click/dismiss through the bridge (SQ-288) by the
+        // time this runs — tracking it again here would double-count. A native display
+        // that already reported a click via onNativeClick skips the dismiss too.
+        if (message.type != IAMType.HTML && nativeTerminalEventFired.compareAndSet(false, true)) {
+            onNativeDismiss?.invoke(message)
+        }
         onDismissed?.invoke(message)
         drainDeferred()
     }
@@ -406,6 +457,9 @@ class InAppMessageController(
             btn.setOnClickListener {
                 onButtonTapped?.invoke(message, iamBtn)
                 handleAction(iamBtn.action)
+                if (nativeTerminalEventFired.compareAndSet(false, true)) {
+                    onNativeClick?.invoke(message, iamBtn.id)
+                }
             }
             btnRow.addView(btn)
         }
@@ -477,6 +531,9 @@ class InAppMessageController(
                 setOnClickListener {
                     onButtonTapped?.invoke(message, iamBtn)
                     handleAction(iamBtn.action)
+                    if (nativeTerminalEventFired.compareAndSet(false, true)) {
+                        onNativeClick?.invoke(message, iamBtn.id)
+                    }
                     dismissOnce()
                 }
             }
@@ -521,6 +578,30 @@ class InAppMessageController(
             }
         })
         banner.startAnimation(anim)
+    }
+
+    // MARK: - HTML
+
+    /**
+     * Returns `true` once the hardened [HtmlInAppMessageRenderer] has a dialog on
+     * screen. Unlike [presentModal]/[presentBanner], the impression is NOT fired
+     * here — [HtmlInAppMessageRenderer] counts it once the WebView's `onPageFinished`
+     * actually runs (US-16), not just because the dialog is attached.
+     */
+    private fun presentHtml(activity: Activity, message: InAppMessage): Boolean {
+        if (message.htmlBody == null) return false
+
+        val renderer = HtmlInAppMessageRenderer(
+            activity = activity,
+            message = message,
+            onImpression = { onImpression?.invoke(message.id) },
+            onClick = { buttonId -> onHtmlClick?.invoke(message, buttonId) },
+            onDismiss = { onHtmlDismiss?.invoke(message) },
+            onClosed = { onPresentationEnded(message) }
+        )
+        val shown = renderer.show()
+        if (shown) currentDismissal = { renderer.close() }
+        return shown
     }
 
     // MARK: - Action Handling

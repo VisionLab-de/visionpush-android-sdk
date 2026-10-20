@@ -79,3 +79,12 @@
 
 # ── Diagnostics ───────────────────────────────────────────────────────────────
 -keep public class de.visionlab.visionpush.DiagnosticReport { *; }
+
+# ── HTML in-app-message JS bridge (US-16) ─────────────────────────────────────
+# WebView's JS engine calls @JavascriptInterface methods by name via reflection;
+# R8 sees no other caller for e.g. `click`/`close`/`addTags`/`removeTags` and
+# strips or renames them, silently breaking window.VisionPush.* at runtime
+# without this rule.
+-keepclassmembers class de.visionlab.visionpush.HtmlIamBridge {
+    @android.webkit.JavascriptInterface <methods>;
+}

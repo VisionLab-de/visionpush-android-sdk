@@ -73,7 +73,11 @@ class DeviceRegistrarTest {
                 else -> 200
             }
             val responseBody = if (status == 403) {
-                "{\"error\":\"external_id_verification_failed\"}"
+                // Real shape (crates/visionpush-api/src/error.rs:177-182): the server
+                // ALWAYS nests {"error":{"code","message"}} — code is the generic
+                // "forbidden" category here (services/identity.rs:62-64); the specific
+                // identifier is in message.
+                "{\"error\":{\"code\":\"forbidden\",\"message\":\"external_id_verification_failed\"}}"
             } else {
                 "{\"device_id\":\"dev-123\"}"
             }

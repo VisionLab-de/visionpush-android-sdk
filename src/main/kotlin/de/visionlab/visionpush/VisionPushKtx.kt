@@ -74,6 +74,30 @@ suspend fun VisionPush.sendOutcomeWithValueAsync(name: String, value: Float) =
 suspend fun VisionPush.refreshTagsAsync(): Map<String, String> =
     awaitResult { cb -> VisionPush.refreshTags(cb) }
 
+/** Suspending version of [VisionPush.login] (US-15). Returns the resulting userId. Throws [VisionPushError] on failure. */
+suspend fun VisionPush.loginAsync(externalId: String, externalIdHash: String? = null): String? =
+    awaitResult { cb -> VisionPush.login(externalId, externalIdHash, cb) }
+
+/** Suspending version of [VisionPush.logout] (US-15). Returns the new anonymous userId. Throws [VisionPushError] on failure. */
+suspend fun VisionPush.logoutAsync(): String? =
+    awaitResult { cb -> VisionPush.logout(cb) }
+
+/** Suspending version of [VisionPush.addAlias] (US-15). Throws [VisionPushError] on failure. */
+suspend fun VisionPush.addAliasAsync(label: String, id: String, aliasHash: String) =
+    awaitUnit { cb -> VisionPush.addAlias(label, id, aliasHash, cb) }
+
+/** Suspending version of [VisionPush.removeAlias] (US-15). Throws [VisionPushError] on failure. */
+suspend fun VisionPush.removeAliasAsync(label: String, id: String, aliasHash: String) =
+    awaitUnit { cb -> VisionPush.removeAlias(label, id, aliasHash, cb) }
+
+/** Suspending version of [VisionPush.addEmail] (US-15). Throws [VisionPushError] on failure. */
+suspend fun VisionPush.addEmailAsync(email: String) =
+    awaitUnit { cb -> VisionPush.addEmail(email, cb) }
+
+/** Suspending version of [VisionPush.addSms] (US-15). Throws [VisionPushError] on failure. */
+suspend fun VisionPush.addSmsAsync(phoneE164: String) =
+    awaitUnit { cb -> VisionPush.addSms(phoneE164, cb) }
+
 // MARK: - Flow Extensions
 
 /** Cold [Flow] that emits every [VisionPushNotification] received while the flow is collected. */

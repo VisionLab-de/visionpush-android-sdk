@@ -85,12 +85,15 @@ internal class ApiClient(
      * @throws VisionPushError.NetworkError if the network request fails.
      * @throws VisionPushError.ApiError     if the server returns a non-2xx response.
      */
-    suspend fun registerDevice(registration: DeviceRegistration): VisionPushResult<String> =
+    suspend fun registerDevice(registration: DeviceRegistration): VisionPushResult<DeviceRegistrationOutcome> =
         post(
             path = "/devices/register",
             body = registration.toJson()
         ).map { response ->
-            response.deviceId ?: "unknown"
+            DeviceRegistrationOutcome(
+                deviceId = response.deviceId ?: "unknown",
+                userId = response.userId
+            )
         }
 
     /**
@@ -129,8 +132,10 @@ internal class ApiClient(
         delete(path = "/devices/$deviceId", body = JSONObject()).map { }
 
     /**
-     * Merges [tags] into the device record identified by [deviceId].
-     * Sends a PUT to `/devices/{id}` with `{"tags": {...}}`.
+     * Merges [tags] into the US-15 user this device belongs to (mirrored onto every
+     * subscription of that user). Sends a PATCH to `/devices/{id}/user` with
+     * `{"tags": {...}}` — tags moved from the device row to the user with US-15;
+     * this is the one route `VisionPush.updateTags`/`removeTags` write through now.
      */
     suspend fun updateDeviceTags(deviceId: String, tags: Map<String, String>): VisionPushResult<Unit> {
         val body = JSONObject().apply {
@@ -138,12 +143,12 @@ internal class ApiClient(
             tags.forEach { (k, v) -> tagsJson.put(k, v) }
             put("tags", tagsJson)
         }
-        return put(path = "/devices/$deviceId", body = body).map { }
+        return patch(path = "/devices/$deviceId/user", body = body).map { }
     }
 
     /**
-     * Removes specific tag keys from the device record identified by [deviceId].
-     * Sends a PUT to `/devices/{id}` with `{"tags_to_remove": [...]}`.
+     * Removes specific tag keys from the US-15 user this device belongs to.
+     * Sends a PATCH to `/devices/{id}/user` with `{"tags_to_remove": [...]}`.
      */
     suspend fun removeDeviceTags(deviceId: String, keys: List<String>): VisionPushResult<Unit> {
         val body = JSONObject().apply {
@@ -151,7 +156,7 @@ internal class ApiClient(
             keys.forEach { arr.put(it) }
             put("tags_to_remove", arr)
         }
-        return put(path = "/devices/$deviceId", body = body).map { }
+        return patch(path = "/devices/$deviceId/user", body = body).map { }
     }
 
     /**
@@ -187,12 +192,16 @@ internal class ApiClient(
 
     /**
      * Fetches in-app messages eligible for this device.
-     * Sends a GET to `/in-app-messages?app_id={appId}&device_id={deviceId}`.
+     * Sends a GET to `/in-app-messages?app_id={appId}&device_id={deviceId}&capabilities=html`.
+     *
+     * `capabilities=html` (US-16) tells the backend this SDK version can render
+     * `type = "html"` messages — without it, the server never includes them, so an
+     * older SDK build can't be handed a message type it doesn't know how to show.
      */
     suspend fun fetchInAppMessages(appId: String, deviceId: String): VisionPushResult<List<InAppMessage>> =
         execute(
             Request.Builder()
-                .url(config.apiBaseUrl + "/in-app-messages?app_id=$appId&device_id=$deviceId")
+                .url(config.apiBaseUrl + "/in-app-messages?app_id=$appId&device_id=$deviceId&capabilities=html")
                 .get()
                 .build()
         ).map { response ->
@@ -207,18 +216,25 @@ internal class ApiClient(
         }
 
     /**
-     * Fetches the current device record and returns the server-side tags.
-     * Sends a GET to `/devices/{id}`.
+     * Fetches the server-side tags of the US-15 user this device belongs to.
+     * Sends a GET to `/devices/{id}/user`, which answers flat
+     * `{"user_id","tags","language","country","aliases","subscriptions"}` —
+     * `tags` is a top-level key, not wrapped in a `data` envelope.
+     *
+     * A `client` key cannot call `GET /devices/{id}` (needs `devices:read`,
+     * which would read every device of the app); this device-bound route needs
+     * only `devices:write`, already granted (SQ-297, `services/user.rs:580`
+     * `UserService::get_device_user`).
      */
     suspend fun getDeviceTags(deviceId: String): VisionPushResult<Map<String, String>> =
         execute(
             Request.Builder()
-                .url(config.apiBaseUrl + "/devices/$deviceId")
+                .url(config.apiBaseUrl + "/devices/$deviceId/user")
                 .get()
                 .build()
         ).map { response ->
             val tags = mutableMapOf<String, String>()
-            response.rawData?.optJSONObject("tags")?.let { obj ->
+            response.rawBody?.optJSONObject("tags")?.let { obj ->
                 obj.keys().forEach { key -> tags[key] = obj.optString(key) }
             }
             tags
@@ -272,11 +288,104 @@ internal class ApiClient(
     }
 
     /**
+     * Adds (or re-asserts) a custom alias on the US-15 user this device belongs to.
+     * Sends a POST to `/devices/{id}/user/aliases` with `{label, alias_id, alias_hash}`.
+     *
+     * [aliasHash] is required by the server (hex HMAC-SHA256 of `"label:alias_id"`,
+     * keyed with the app's identity secret) — an app without an identity secret
+     * gets 403. An alias already owned by another user is 409
+     * ([VisionPushError.ApiError.isSubscriptionOwnedByAnotherUser]).
+     */
+    suspend fun addUserAlias(
+        deviceId: String,
+        label: String,
+        aliasId: String,
+        aliasHash: String
+    ): VisionPushResult<Unit> {
+        val body = JSONObject().apply {
+            put("label", label)
+            put("alias_id", aliasId)
+            put("alias_hash", aliasHash)
+        }
+        return post(path = "/devices/$deviceId/user/aliases", body = body).map { }
+    }
+
+    /**
+     * Removes a custom alias from the US-15 user this device belongs to.
+     * Sends a DELETE to `/devices/{id}/user/aliases` with `{label, alias_id, alias_hash}` —
+     * the server verifies the same signature as [addUserAlias] before removing it.
+     */
+    suspend fun removeUserAlias(
+        deviceId: String,
+        label: String,
+        aliasId: String,
+        aliasHash: String
+    ): VisionPushResult<Unit> {
+        val body = JSONObject().apply {
+            put("label", label)
+            put("alias_id", aliasId)
+            put("alias_hash", aliasHash)
+        }
+        return delete(path = "/devices/$deviceId/user/aliases", body = body).map { }
+    }
+
+    /**
+     * Adds an email or SMS subscription to the US-15 user this device belongs to.
+     * Sends a POST to `/devices/{id}/user/subscriptions` with `{"type", "token"}`.
+     *
+     * [kind] is `"email"` or `"sms"`; [token] is the address (email, or phone in
+     * E.164). The server answers 201 for a new subscription, 200 when this user
+     * already owns it, and 409 when another user already owns it
+     * ([VisionPushError.ApiError.isSubscriptionOwnedByAnotherUser]).
+     */
+    suspend fun addUserSubscription(
+        deviceId: String,
+        kind: String,
+        token: String
+    ): VisionPushResult<Unit> {
+        val body = JSONObject().apply {
+            put("type", kind)
+            put("token", token)
+        }
+        return post(path = "/devices/$deviceId/user/subscriptions", body = body).map { }
+    }
+
+    /**
      * Tracks an in-app message impression (fire-and-forget; errors are silently swallowed).
      */
     suspend fun trackIAMImpression(appId: String, deviceId: String, messageId: String): VisionPushResult<Unit> =
         post(
             path = "/in-app-messages/$messageId/impression",
+            body = JSONObject().apply { put("app_id", appId); put("device_id", deviceId) }
+        ).map { }
+
+    /**
+     * Tracks an in-app message click (fire-and-forget; errors are silently swallowed).
+     * Used by the US-16 HTML bridge's `click(actionId, …)`; [buttonId] is the action
+     * id the message content passed, server-validated by `is_valid_button_id`.
+     */
+    suspend fun trackIAMClick(
+        appId: String,
+        deviceId: String,
+        messageId: String,
+        buttonId: String? = null
+    ): VisionPushResult<Unit> =
+        post(
+            path = "/in-app-messages/$messageId/click",
+            body = JSONObject().apply {
+                put("app_id", appId)
+                put("device_id", deviceId)
+                put("button_id", buttonId ?: JSONObject.NULL)
+            }
+        ).map { }
+
+    /**
+     * Tracks an in-app message dismiss (fire-and-forget; errors are silently swallowed).
+     * Used by the US-16 HTML bridge's `close()`.
+     */
+    suspend fun trackIAMDismiss(appId: String, deviceId: String, messageId: String): VisionPushResult<Unit> =
+        post(
+            path = "/in-app-messages/$messageId/dismiss",
             body = JSONObject().apply { put("app_id", appId); put("device_id", deviceId) }
         ).map { }
 
@@ -345,6 +454,14 @@ internal class ApiClient(
                 .build()
         )
 
+    private suspend fun patch(path: String, body: JSONObject): VisionPushResult<ApiResponse> =
+        execute(
+            Request.Builder()
+                .url(config.apiBaseUrl + path)
+                .patch(body.toRequestBody())
+                .build()
+        )
+
     private suspend fun delete(path: String, body: JSONObject): VisionPushResult<ApiResponse> =
         execute(
             Request.Builder()
@@ -382,12 +499,18 @@ internal class ApiClient(
                         VisionPushResult.Success(ApiResponse.fromJson(json))
                     } else {
                         retryAfterMs = RetryBackoff.parseRetryAfterMs(response.header("Retry-After"))
-                        // Error bodies are either {"message": "..."} or a bare code
-                        // {"error": "<code>"} (e.g. external_id_verification_failed);
-                        // keep the code machine-readable instead of flattening it away.
-                        val errorCode = json.optString("error").takeIf { it.isNotBlank() }
-                        val message = json.optString("message").takeIf { it.isNotBlank() }
-                            ?: errorCode
+                        // The server ALWAYS answers a non-2xx with the nested envelope
+                        // {"error":{"code":"...","message":"..."}} (crates/visionpush-api/src/error.rs:177-182),
+                        // never a top-level "message" or a bare {"error":"<code>"} string.
+                        // `code` is often a generic category (e.g. "forbidden", "conflict")
+                        // shared by many distinct rejections — the specific, machine-readable
+                        // identifier (e.g. "external_id_verification_failed") lives in
+                        // `message` for those. Keep both: `errorCode` holds `code` as the
+                        // server sends it, and callers like [VisionPushError.ApiError] match
+                        // on `message` where that is where the real identifier lands.
+                        val errorObj = json.optJSONObject("error")
+                        val errorCode = errorObj?.optString("code")?.takeIf { it.isNotBlank() }
+                        val message = errorObj?.optString("message")?.takeIf { it.isNotBlank() }
                             ?: "Unexpected server error."
                         VisionPushResult.Failure(VisionPushError.ApiError(response.code, message, errorCode))
                     }

@@ -54,7 +54,7 @@ dependencyResolutionManagement {
 
 ```kotlin
 dependencies {
-    implementation("com.github.VisionLab-de:visionpush-android-sdk:1.1.1")
+    implementation("com.github.VisionLab-de:visionpush-android-sdk:1.2.0")
 }
 ```
 
@@ -72,7 +72,7 @@ dependencyResolutionManagement {
 
 ```kotlin
 dependencies {
-    implementation("de.visionlab:visionpush-android:1.1.1")
+    implementation("de.visionlab:visionpush-android:1.2.0")
 }
 ```
 
@@ -407,31 +407,114 @@ Two behaviours worth knowing:
 
 ---
 
-## Identifying Users
+## In-App Messages — HTML (`type: "html"`)
 
-Associate the VisionPush device record with a user in your own system:
+An in-app message of `type = "html"` renders its `html_body` in a hardened,
+isolated `WebView` — no file/content access, no DOM storage, no geolocation,
+and every navigation is blocked. The message counts an impression once the
+page actually finishes loading, not just because the WebView is attached.
+
+The rendered HTML gets exactly one global object, `window.VisionPush`, backed
+by a native bridge with no other API surface (no cookies, no storage, no
+access to anything else in the app):
+
+```js
+// Record a click (button_id = "primary" in the dashboard's click analytics)
+// and, if the url is http(s), open it in the system browser. Then closes.
+window.VisionPush.click("primary", "https://example.com/offer");
+
+// Record a dismiss, then close — e.g. wired to a close ("×") button.
+window.VisionPush.close();
+
+// Merge tags into the device — same validation/limits as VisionPush.updateTags.
+window.VisionPush.addTags({ plan: "pro" });
+
+// Remove tags from the device — same as VisionPush.removeTags.
+window.VisionPush.removeTags(["plan"]);
+```
+
+A call with the wrong argument shape (a missing/blank action id, a non-http(s)
+URL, malformed JSON) is ignored rather than thrown — the HTML content is
+campaign-authored and untrusted; isolation is the WebView sandbox, not
+server-side sanitising.
+
+No host-app code is required: the native `InAppMessageController` dispatches
+`type = "html"` messages to this renderer the same way it already dispatches
+`modal`/`banner`/`fullscreen` messages, and `VisionPush.initialize()` already
+requests `capabilities=html` so the backend knows this SDK version can show
+them.
+
+---
+
+## Identifying Users (OneSignal-style user model)
+
+VisionPush's identity model follows OneSignal v5 semantics: every device registers as an **anonymous user** first; `login()` attaches your own system's identifier to it (or hands the subscription to the existing user that already owns that identifier); `logout()` detaches it again onto a brand-new anonymous user. A user can carry several **aliases** (a reserved `external_id` plus any custom namespace you add), an **email** and/or **SMS subscription**, and user-level **tags**/**language**/**country** — all mirrored onto every device that belongs to it.
 
 ```kotlin
 // After sign-in
-VisionPush.setExternalId("usr_abc123")
+VisionPush.login("usr_abc123")
 
-// After sign-out
-VisionPush.setExternalId(null)
-// or use logout() to fully unregister the device
+// After sign-out — the subscription moves to a NEW anonymous user; it does
+// NOT unregister the device from push (use deleteDevice() for that, see below)
+VisionPush.logout()
 ```
 
-The SDK persists the external ID across process restarts and includes it in every device registration payload. Setting the same value again is idempotent.
-
-Passing `null` **clears** the association on the backend. Because the device upsert treats an omitted `external_id` as "leave unchanged", the SDK sends an explicit `PUT /devices/{id}` with `{"clear_external_id": true}` before re-registering. If that call fails (offline), the clear stays pending locally and is retried on the next registration sync — the device never silently keeps the previous user's ID.
+The SDK persists the external ID across process restarts and includes it in every device registration payload. Calling `login()` again with the same (id, hash) pair is idempotent — no network call. `login`/`logout` are asynchronous; read [`VisionPush.userId`](#api-reference) once the callback fires, or listen for every change:
 
 ```kotlin
-// Read back the current value
-val userId: String? = VisionPush.externalId
+VisionPush.setOnUserChangedListener { userId ->
+    Log.d("App", "VisionPush user id: $userId")
+}
+
+VisionPush.login("usr_abc123") { result ->
+    result.onSuccess { userId -> /* userId now reflects the server's answer */ }
+}
 ```
+
+Logging out clears the external id on the backend. Because the device upsert treats an omitted `external_id` as "leave unchanged", the SDK sends an explicit `PUT /devices/{id}` with `{"clear_external_id": true}` before re-registering. If that call fails (offline), the clear stays pending locally and is retried on the next registration sync — the device never silently keeps the previous user's ID.
+
+```kotlin
+// Read back the current values
+val userId: String? = VisionPush.userId
+val externalId: String? = VisionPush.externalId
+```
+
+> **Deprecated:** `setExternalId(id, hash?)` still works — it delegates to `login()` for a non-null id and `logout()` for `null` — but new code should call `login`/`logout` directly.
+
+### Aliases, email and SMS
+
+Add a second identifier namespace, or another channel, to the current user:
+
+```kotlin
+// A custom alias — aliasHash is the same kind of backend-computed HMAC as
+// externalIdHash below (over "label:id" instead of just the id)
+VisionPush.addAlias("loyalty_card", "LC-55219", aliasHash = hashFromYourBackend)
+VisionPush.removeAlias("loyalty_card", "LC-55219", aliasHash = hashFromYourBackend)
+
+// Email / SMS subscriptions — validated locally, then sent to the backend
+VisionPush.addEmail("jana@example.com")
+VisionPush.addSms("+4915123456789")
+```
+
+An address or alias already owned by a *different* user comes back as a typed 409:
+
+```kotlin
+VisionPush.addEmail("taken@example.com") { result ->
+    result.onFailure { error ->
+        if ((error as? VisionPushError.ApiError)?.isSubscriptionOwnedByAnotherUser == true) {
+            // show "this address is already in use" instead of retrying
+        }
+    }
+}
+```
+
+### Tags are now user-level
+
+`updateTags`/`removeTags` keep their signatures, but write to the **user** (mirrored onto every subscription of that user) since US-15 — so tags survive a `login()` from a different device, not just this one.
 
 ### Identity verification
 
-With a client API key, any user of your app could otherwise call `setExternalId("<someone else's id>")` and receive that user's pushes. Enable **identity verification** for the app in the VisionPush dashboard to close this: the server then only accepts an external id that comes with a hash proving your backend vouches for it.
+With a client API key, any user of your app could otherwise call `login("<someone else's id>")` and receive that user's pushes. Enable **identity verification** for the app in the VisionPush dashboard to close this: the server then only accepts an external id (or custom alias) that comes with a hash proving your backend vouches for it.
 
 ```
 external_id_hash = lowercase hex( HMAC-SHA256( key = <app identity secret> as UTF-8, message = <external_id> as UTF-8 ) )
@@ -448,7 +531,7 @@ const externalIdHash = crypto
 ```
 
 ```kotlin
-VisionPush.setExternalId("usr_abc123", externalIdHash = hashFromYourBackend) { result ->
+VisionPush.login("usr_abc123", externalIdHash = hashFromYourBackend) { result ->
     result.onFailure { error ->
         if ((error as? VisionPushError.ApiError)?.isExternalIdVerificationFailed == true) {
             // hash missing or wrong — fetch a fresh one from your backend and retry
@@ -459,10 +542,10 @@ VisionPush.setExternalId("usr_abc123", externalIdHash = hashFromYourBackend) { r
 
 ```java
 // Java
-VisionPush.setExternalId("usr_abc123", hashFromYourBackend);
+VisionPush.login("usr_abc123", hashFromYourBackend);
 ```
 
-The SDK stores the hash next to the id (in the same encrypted store) and re-sends both on every registration (e.g. after an FCM token rotation); `setExternalId(null)` needs no hash. A missing or wrong hash is rejected by the server with HTTP 403 `{"error":"external_id_verification_failed"}` — surfaced as `VisionPushError.ApiError` with `isExternalIdVerificationFailed == true` through the callback and `onError`, logged at ERROR level, **not retried**, and the device keeps its previously accepted identity locally. With verification disabled the field is ignored, so passing it is always safe. A hash that is not 64 hex characters is rejected locally with `VisionPushError.InvalidArgument`.
+The SDK stores the hash next to the id (in the same encrypted store) and re-sends both on every registration (e.g. after an FCM token rotation); `logout()` needs no hash. A missing or wrong hash is rejected by the server with HTTP 403 `{"error":"external_id_verification_failed"}` — surfaced as `VisionPushError.ApiError` with `isExternalIdVerificationFailed == true` through the callback and `onError`, logged at ERROR level, **not retried**, and the device keeps its previously accepted identity locally. With verification disabled the field is ignored, so passing it is always safe. A hash that is not 64 hex characters is rejected locally with `VisionPushError.InvalidArgument`.
 
 ---
 
@@ -518,20 +601,22 @@ The callbacks are optional. Kotlin coroutine callers can use `VisionPush.optOut(
 
 ---
 
-## User Logout
+## Device Deletion
 
-Call `logout()` when the user signs out to remove the device record from the backend and clear all locally persisted state:
+> Not to be confused with [`logout()`](#identifying-users-onesignal-style-user-model) above, which detaches the current external identity but keeps the device registered and receiving push.
+
+Call `deleteDevice()` when the user signs out to remove the device record from the backend entirely and clear all locally persisted state:
 
 ```kotlin
-VisionPush.logout { result ->
+VisionPush.deleteDevice { result ->
     result.onSuccess {
         // Handlers are also cleared automatically
-        // Call initialize() or setExternalId() for the next user
+        // Call initialize() or login() for the next user
     }
 }
 ```
 
-After `logout()`, the SDK remains initialized — call `VisionPush.setExternalId()` with the new user's ID or call `VisionPush.syncDevice()` to register a fresh anonymous device.
+After `deleteDevice()`, the SDK remains initialized — call `VisionPush.login()` with the new user's ID or call `VisionPush.syncDevice()` to register a fresh anonymous device.
 
 ---
 
@@ -645,9 +730,9 @@ before the user agrees, then call `VisionPush.setConsentGiven(true)` once they d
 
 Until consent is given, **nothing leaves the device**:
 
-- no device registration, and every explicit API call (`updateTags`, `setExternalId`,
-  `trackOpened`, `sendOutcome`, `enableRealtime`, `enableGeofencing`, …) throws
-  `VisionPushError.ConsentRequired`;
+- no device registration, and every explicit API call (`updateTags`, `login`, `logout`,
+  `addAlias`, `addEmail`, `addSms`, `trackOpened`, `sendOutcome`, `enableRealtime`,
+  `enableGeofencing`, …) throws `VisionPushError.ConsentRequired`;
 - the **automatic** events the SDK would otherwise report on its own — `delivered`
   when a push is shown, `opened` / `dismissed` when the user interacts with it, geofence
   transitions — are dropped silently (debug log only).
@@ -727,12 +812,20 @@ All methods are on the `VisionPush` singleton object.
 | `handlePermissionResult` | `(context, requestCode, permissions, grantResults) Unit` | Forward from `onRequestPermissionsResult` |
 | `handlePermissionResult` | `(context, granted: Boolean) Unit` | Forward from Activity Result API callback |
 
-### User Identification
+### User Identification (US-15)
 
 | Method | Signature | Description |
 |---|---|---|
-| `setExternalId` | `(externalId: String?, externalIdHash: String? = null, callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Associate device with an external user ID; `null` clears the association. `externalIdHash` (backend-computed HMAC, see [Identity verification](#identity-verification)) is required when identity verification is enabled for the app |
+| `login` | `(externalId: String, externalIdHash: String? = null, callback: ((VisionPushResult<String?>) -> Unit)? = null) Unit` | Associate this installation with an external user ID; `userId` reflects the server's answer. `externalIdHash` (backend-computed HMAC, see [Identity verification](#identity-verification)) is required when identity verification is enabled for the app |
+| `logout` | `(callback: ((VisionPushResult<String?>) -> Unit)? = null) Unit` | Detach the current external identity — the subscription moves to a new anonymous user. Does **not** unregister the device (see [`deleteDevice`](#device)) |
+| `setExternalId` | *(deprecated)* `(externalId: String?, externalIdHash: String? = null, callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Delegates to `login`/`logout` |
 | `externalId` | `String?` | The current external ID, or `null` if not set |
+| `userId` | `String?` | The user id this installation's subscription currently belongs to, or `null` before first registration |
+| `setOnUserChangedListener` | `(listener: ((userId: String?) -> Unit)?) Unit` | Callback invoked on the main thread whenever `userId` changes |
+| `addAlias` | `(label: String, id: String, aliasHash: String, callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Add a custom alias namespace to the current user; 403 without an identity secret, 409 if owned by another user |
+| `removeAlias` | `(label: String, id: String, aliasHash: String, callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Remove a custom alias (same signed proof as `addAlias`) |
+| `addEmail` | `(email: String, callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Add an email subscription to the current user; 409 if owned by another user |
+| `addSms` | `(phoneE164: String, callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Add an SMS subscription (E.164) to the current user; 409 if owned by another user |
 
 ### Notification Handlers
 
@@ -760,7 +853,7 @@ All methods are on the `VisionPush` singleton object.
 | Method | Signature | Description |
 |---|---|---|
 | `syncDevice` | `(callback: ((VisionPushResult<String>) -> Unit)? = null) Unit` | Force an immediate registration sync |
-| `logout` | `(callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Unregister the device and clear all local state |
+| `deleteDevice` | `(callback: ((VisionPushResult<Unit>) -> Unit)? = null) Unit` | Unregister the device and clear all local state (see `logout` under [User Identification](#user-identification-us-15) to just detach the current user) |
 | `adoptInstallationId` | `(context: Context, id: String) String` | Seed the installation id from another bridge (Unity migration); no-op if one already exists |
 | `deviceId` | `String?` | The server-assigned device ID, or `null` before first registration |
 | `isInitialized` | `Boolean` | `true` after a successful `initialize()` call |
@@ -785,7 +878,7 @@ Event delivery (opens, action taps, dismissals) is handled entirely through Work
 ## SDK Version
 
 ```kotlin
-val version: String = VisionPush.SDK_VERSION  // e.g. "1.1.1"
+val version: String = VisionPush.SDK_VERSION  // e.g. "1.2.0"
 ```
 
 ---

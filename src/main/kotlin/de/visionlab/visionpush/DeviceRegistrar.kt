@@ -89,6 +89,26 @@ internal class DeviceRegistrar(
         private set(value) = prefs.edit().putString(KEY_DEVICE_ID, value).apply()
 
     /**
+     * The US-15 user this device's subscription currently belongs to (anonymous
+     * until a [VisionPush.login]). Persisted exactly the way [deviceId] is —
+     * same encrypted store, survives process restarts, wiped by [clearLocalState].
+     *
+     * [onUserIdChanged] fires whenever a write actually changes the value, so
+     * [VisionPush]'s user-change listener observes every login/logout, not just
+     * ones a caller happened to be awaiting.
+     */
+    internal var userId: String?
+        get() = prefs.getString(KEY_USER_ID, null)
+        private set(value) {
+            val previous = prefs.getString(KEY_USER_ID, null)
+            prefs.edit().putString(KEY_USER_ID, value).apply()
+            if (value != null && value != previous) onUserIdChanged?.invoke(value)
+        }
+
+    /** Set by [VisionPush] to forward every [userId] change to its public listener. */
+    @Volatile internal var onUserIdChanged: ((String?) -> Unit)? = null
+
+    /**
      * Caller-supplied external user identifier (nullable).
      *
      * Setting `null` after a non-null value marks a server-side clear as pending
@@ -279,7 +299,17 @@ internal class DeviceRegistrar(
     suspend fun register(
         forceRefresh: Boolean = false,
         initialTags: Map<String, String> = emptyMap()
-    ): VisionPushResult<String> {
+    ): VisionPushResult<String> = registerForOutcome(forceRefresh, initialTags).map { it.deviceId }
+
+    /**
+     * Same as [register] but keeps the server's `user_id` (US-15) in the result
+     * instead of discarding it — [VisionPush.login] / [VisionPush.logout] need
+     * the fresh user id a login/logout's forced re-registration just produced.
+     */
+    internal suspend fun registerForOutcome(
+        forceRefresh: Boolean = false,
+        initialTags: Map<String, String> = emptyMap()
+    ): VisionPushResult<DeviceRegistrationOutcome> {
         val token = fetchToken() ?: return VisionPushResult.Failure(
             VisionPushError.TokenUnavailable()
         )
@@ -294,7 +324,7 @@ internal class DeviceRegistrar(
         // Skip if the device state has not changed and forceRefresh is not set
         if (!forceRefresh && lastRegisteredToken == token && prefs.getString(KEY_LAST_STATE, null) == stateKey) {
             VisionPushLogger.d(TAG, "Device state unchanged – skipping registration.")
-            return VisionPushResult.Success(deviceId ?: "")
+            return VisionPushResult.Success(DeviceRegistrationOutcome(deviceId ?: "", userId))
         }
 
         VisionPushLogger.i(TAG, "Registering device with VisionPush backend.")
@@ -302,9 +332,11 @@ internal class DeviceRegistrar(
         val result = apiClient.registerDevice(registration)
         when (result) {
             is VisionPushResult.Success -> {
-                val id = result.data
+                val outcome = result.data
+                val id = outcome.deviceId
                 lastRegisteredToken = token
                 deviceId = id
+                outcome.userId?.let { userId = it }
                 prefs.edit().putString(KEY_LAST_STATE, stateKey).apply()
                 VisionPushLogger.i(TAG, "Device registered successfully. deviceId=$id")
                 // A NEW device row (first registration, or a re-created identity after
@@ -373,12 +405,14 @@ internal class DeviceRegistrar(
         VisionPushLogger.i(TAG, "FCM token rotated – triggering re-registration.")
         val registration = buildRegistration(newToken)
         return apiClient.registerDevice(registration)
-            .onSuccess { id ->
+            .onSuccess { outcome ->
                 lastRegisteredToken = newToken
-                deviceId = id
+                deviceId = outcome.deviceId
+                outcome.userId?.let { userId = it }
                 prefs.edit().putString(KEY_LAST_STATE, registration.stateKey()).apply()
             }
             .onFailure { error -> handleVerificationFailure(error) }
+            .map { it.deviceId }
     }
 
     /**
@@ -579,6 +613,7 @@ internal class DeviceRegistrar(
 
         private const val KEY_LAST_TOKEN = "last_fcm_token"
         private const val KEY_DEVICE_ID = "device_id"
+        private const val KEY_USER_ID = "user_id"
         private const val KEY_EXTERNAL_ID = "external_id"
         private const val KEY_EXTERNAL_ID_HASH = "external_id_hash"
         private const val KEY_EXTERNAL_ID_CLEAR_PENDING = "external_id_clear_pending"
@@ -588,7 +623,7 @@ internal class DeviceRegistrar(
             "External ID rejected (HTTP 403 external_id_verification_failed): identity verification " +
                     "is enabled for this app — pass the hash your backend computed (lowercase hex HMAC-SHA256 " +
                     "of the external id, keyed with the app's identity secret) via " +
-                    "VisionPush.setExternalId(externalId, externalIdHash). The request is not retried."
+                    "VisionPush.login(externalId, externalIdHash). The request is not retried."
         private const val KEY_OPTED_OUT = "opted_out"
         private const val KEY_LAST_STATE = "last_reg_state"
         private const val KEY_ANONYMOUS_ID = "anonymous_id"
