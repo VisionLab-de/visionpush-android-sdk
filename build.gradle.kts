@@ -26,7 +26,7 @@ android {
         targetSdk = 34
 
         // SDK version constants injected into BuildConfig at compile time
-        buildConfigField("String", "VISIONPUSH_SDK_VERSION", "\"1.1.0\"")
+        buildConfigField("String", "VISIONPUSH_SDK_VERSION", "\"1.1.1\"")
         buildConfigField("String", "VISIONPUSH_DEFAULT_API_BASE_URL", "\"https://api.visionpush.de/v1\"")
 
         consumerProguardFiles("consumer-rules.pro")
@@ -157,7 +157,7 @@ mavenPublishing {
     if (project.hasProperty("signingInMemoryKey") || project.hasProperty("signing.keyId")) {
         signAllPublications()
     }
-    coordinates("de.visionlab", "visionpush-android", "1.1.0")
+    coordinates("de.visionlab", "visionpush-android", "1.1.1")
 
     pom {
         name.set("VisionPush Android SDK")

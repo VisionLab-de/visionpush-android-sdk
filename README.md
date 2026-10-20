@@ -54,7 +54,7 @@ dependencyResolutionManagement {
 
 ```kotlin
 dependencies {
-    implementation("com.github.VisionLab-de:visionpush-android-sdk:1.1.0")
+    implementation("com.github.VisionLab-de:visionpush-android-sdk:1.1.1")
 }
 ```
 
@@ -72,7 +72,7 @@ dependencyResolutionManagement {
 
 ```kotlin
 dependencies {
-    implementation("de.visionlab:visionpush-android:1.1.0")
+    implementation("de.visionlab:visionpush-android:1.1.1")
 }
 ```
 
@@ -785,7 +785,7 @@ Event delivery (opens, action taps, dismissals) is handled entirely through Work
 ## SDK Version
 
 ```kotlin
-val version: String = VisionPush.SDK_VERSION  // e.g. "1.1.0"
+val version: String = VisionPush.SDK_VERSION  // e.g. "1.1.1"
 ```
 
 ---

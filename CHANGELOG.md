@@ -2,7 +2,18 @@
 
 All notable changes to the VisionPush Android SDK.
 
-## 1.1.0
+## 1.1.1
+
+### Fixed
+- `jitpack.yml`: the `install` task called
+  `publishReleasePublicationToMavenLocal`, which doesn't exist since the
+  switch to `com.vanniktech.maven.publish` (the publication is named
+  `maven`). JitPack's build of the `1.1.0` tag failed with "Task
+  'publishReleasePublicationToMavenLocal' not found" and cached that
+  failure, so **`1.1.0` was never resolvable via JitPack** — use `1.1.1`
+  instead. The task is now `./gradlew clean publishToMavenLocal -x test`.
+
+## 1.1.0 (not published — JitPack build broken, see 1.1.1)
 
 Additive release: everything in `1.0.0` keeps working; new APIs land alongside it.
 The Flutter, React Native, Huawei and Unity plugins require `1.1.0` or later —

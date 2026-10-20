@@ -4,7 +4,12 @@
 jdk:
   - openjdk17
 
-# JitPack publishes the `release` Maven publication declared in build.gradle.kts
+# JitPack publishes the Maven publication declared in build.gradle.kts via
+# com.vanniktech.maven.publish, which names the publication `maven` — not
+# `release` — so the task is publishToMavenLocal, not
+# publishReleasePublicationToMavenLocal (that task doesn't exist and failed
+# the JitPack build of the 1.1.0 tag: "Task
+# 'publishReleasePublicationToMavenLocal' not found").
 # (artifact group is overridden to com.github.VisionLab-de on JitPack).
 install:
-  - ./gradlew clean assembleRelease publishReleasePublicationToMavenLocal -x test
+  - ./gradlew clean publishToMavenLocal -x test
