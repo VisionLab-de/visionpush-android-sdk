@@ -164,6 +164,21 @@ enum class IAMTriggerType {
 
 // MARK: - Controller
 
+/**
+ * Queues in-app messages and presents them one at a time on the foreground activity.
+ *
+ * Two queues:
+ * - the trigger queue (`queue`): messages waiting for THEIR trigger (session start,
+ *   notification open, a custom event, or a manual `presentMessage`);
+ * - the deferred queue (`deferred`): messages whose trigger already fired but that could
+ *   not be shown yet — another message was on screen, or no usable foreground activity
+ *   existed. They are drained, in order, whenever a slot frees up: after the current
+ *   message is dismissed, and when an activity resumes.
+ *
+ * `onImpression` fires only once a message is actually on screen (dialog shown / banner
+ * attached) — never for an attempt that could not present, so a message that is
+ * deferred or fails to show is not billed as an impression.
+ */
 class InAppMessageController(
     private val application: Application
 ) : Application.ActivityLifecycleCallbacks {
@@ -177,12 +192,24 @@ class InAppMessageController(
 
     // MARK: - State
 
+    /** Messages waiting for their trigger. */
     private val queue = mutableListOf<InAppMessage>()
+
+    /** Messages whose trigger fired but that are waiting for a free slot / an activity. */
+    private val deferred = ArrayDeque<InAppMessage>()
+
     private var isPresenting = false
     private var foregroundActivity: Activity? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    val queuedMessageCount: Int get() = queue.size
+    /** Dismisses whatever is currently on screen (set once a presentation succeeded). */
+    private var currentDismissal: (() -> Unit)? = null
+
+    /** Messages in either queue (waiting for a trigger, or deferred behind another message). */
+    val queuedMessageCount: Int get() = queue.size + deferred.size
+
+    /** Messages whose trigger already fired but that are waiting to be shown. */
+    val deferredMessageCount: Int get() = deferred.size
 
     init {
         application.registerActivityLifecycleCallbacks(this)
@@ -190,7 +217,11 @@ class InAppMessageController(
 
     // MARK: - Lifecycle
 
-    override fun onActivityResumed(activity: Activity) { foregroundActivity = activity }
+    override fun onActivityResumed(activity: Activity) {
+        foregroundActivity = activity
+        // A message deferred for lack of an activity gets its chance now.
+        drainDeferred()
+    }
     override fun onActivityPaused(activity: Activity) {
         if (foregroundActivity === activity) foregroundActivity = null
     }
@@ -238,38 +269,83 @@ class InAppMessageController(
         present(msg)
     }
 
+    /**
+     * Dismisses the message currently on screen (its dismiss callback then drains the
+     * next deferred message). With nothing on screen, just frees the slot and drains.
+     */
     fun dismissCurrent() {
-        isPresenting = false
+        val dismiss = currentDismissal
+        if (dismiss != null) {
+            dismiss()
+        } else {
+            isPresenting = false
+            drainDeferred()
+        }
     }
 
     // MARK: - Presentation
 
     private fun present(message: InAppMessage) {
         if (isPresenting) {
-            queue.add(0, message)
+            // One at a time: park it behind the current message, in trigger order.
+            deferred.addLast(message)
             return
         }
         isPresenting = true
-        onImpression?.invoke(message.id)
 
         mainHandler.post {
             val activity = foregroundActivity
             if (activity == null || activity.isFinishing || activity.isDestroyed) {
+                // No usable activity right now — park it at the head; onActivityResumed
+                // drains it. No impression: nothing was shown.
                 isPresenting = false
-                queue.add(0, message)
+                deferred.addFirst(message)
                 return@post
             }
 
-            when (message.type) {
-                IAMType.MODAL, IAMType.FULLSCREEN -> presentModal(activity, message)
-                IAMType.BANNER -> presentBanner(activity, message)
+            val shown = try {
+                when (message.type) {
+                    IAMType.MODAL, IAMType.FULLSCREEN -> presentModal(activity, message)
+                    IAMType.BANNER -> presentBanner(activity, message)
+                }
+            } catch (e: Exception) {
+                // e.g. WindowManager.BadTokenException when the activity is going away.
+                VisionPushLogger.w(TAG, "Presenting in-app message ${message.id} failed: ${e.message}")
+                false
+            }
+
+            if (shown) {
+                // Billed only now — the message is actually on screen.
+                onImpression?.invoke(message.id)
+            } else {
+                // Not shown: free the slot and drop the message rather than looping on a
+                // message that deterministically fails to present.
+                currentDismissal = null
+                isPresenting = false
+                drainDeferred()
             }
         }
     }
 
+    /** Shared end-of-presentation path for every dismiss route (tap, timer, dismissCurrent). */
+    private fun onPresentationEnded(message: InAppMessage) {
+        currentDismissal = null
+        isPresenting = false
+        onDismissed?.invoke(message)
+        drainDeferred()
+    }
+
+    /** Presents the next deferred message, if any and if nothing is on screen. */
+    private fun drainDeferred() {
+        if (isPresenting) return
+        val next = deferred.removeFirstOrNull() ?: return
+        present(next)
+    }
+
     // MARK: - Modal
 
-    private fun presentModal(activity: Activity, message: InAppMessage) {
+    /** Returns `true` once the dialog is showing. Throws if the window cannot be attached. */
+    private fun presentModal(activity: Activity, message: InAppMessage): Boolean {
         val scrollView = ScrollView(activity)
         val container = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
@@ -348,19 +424,20 @@ class InAppMessageController(
             )
         }
 
-        dialog.setOnDismissListener {
-            isPresenting = false
-            onDismissed?.invoke(message)
-        }
-        dialog.show()
+        dialog.setOnDismissListener { onPresentationEnded(message) }
+        dialog.show() // may throw (BadTokenException) → caller treats as "not shown"
+        currentDismissal = { if (dialog.isShowing) dialog.dismiss() }
 
-        val delayMs = message.dismissAfter ?: return
-        mainHandler.postDelayed({ dialog.dismiss() }, delayMs)
+        message.dismissAfter?.let { delayMs ->
+            mainHandler.postDelayed({ if (dialog.isShowing) dialog.dismiss() }, delayMs)
+        }
+        return true
     }
 
     // MARK: - Banner
 
-    private fun presentBanner(activity: Activity, message: InAppMessage) {
+    /** Returns `true` once the banner view is attached to the activity's content view. */
+    private fun presentBanner(activity: Activity, message: InAppMessage): Boolean {
         val rootView = activity.window.decorView.findViewById<FrameLayout>(android.R.id.content)
         val bgColor = parseColor(message.backgroundColor, Color.parseColor("#007AFF"))
         val fgColor = parseColor(message.textColor, Color.WHITE)
@@ -382,6 +459,15 @@ class InAppMessageController(
         }
         banner.addView(label)
 
+        // Guard against the tap + auto-dismiss timer both dismissing the same banner.
+        var dismissing = false
+        val dismissOnce: () -> Unit = {
+            if (!dismissing && banner.parent != null) {
+                dismissing = true
+                dismissBanner(rootView, banner, message)
+            }
+        }
+
         message.primaryButton?.let { iamBtn ->
             val btn = Button(activity).apply {
                 text = iamBtn.text
@@ -391,7 +477,7 @@ class InAppMessageController(
                 setOnClickListener {
                     onButtonTapped?.invoke(message, iamBtn)
                     handleAction(iamBtn.action)
-                    dismissBanner(rootView, banner, message)
+                    dismissOnce()
                 }
             }
             banner.addView(btn)
@@ -405,6 +491,7 @@ class InAppMessageController(
         }
         banner.layoutParams = lp
         rootView.addView(banner)
+        currentDismissal = dismissOnce
 
         val translateFrom = if (isTop) -300f else 300f
         val anim = TranslateAnimation(0f, 0f, translateFrom, 0f).apply {
@@ -414,9 +501,8 @@ class InAppMessageController(
         banner.startAnimation(anim)
 
         val delayMs = message.dismissAfter ?: 4000L
-        mainHandler.postDelayed({
-            if (banner.parent != null) dismissBanner(rootView, banner, message)
-        }, delayMs)
+        mainHandler.postDelayed({ dismissOnce() }, delayMs)
+        return true
     }
 
     private fun dismissBanner(rootView: FrameLayout, banner: LinearLayout, message: InAppMessage) {
@@ -431,8 +517,7 @@ class InAppMessageController(
             override fun onAnimationRepeat(a: android.view.animation.Animation?) = Unit
             override fun onAnimationEnd(a: android.view.animation.Animation?) {
                 rootView.removeView(banner)
-                isPresenting = false
-                onDismissed?.invoke(message)
+                onPresentationEnded(message)
             }
         })
         banner.startAnimation(anim)
@@ -444,15 +529,24 @@ class InAppMessageController(
         val activity = foregroundActivity ?: return
         when (action?.type) {
             IAMActionType.OPEN_URL -> {
+                // Vet the server-supplied URL's scheme — the SAME allowlist the
+                // notification deep-link path uses (UrlSecurity) — so an IAM action
+                // can't ACTION_VIEW a content://, file://, or javascript: URL.
                 action.url?.let { url ->
-                    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
-                    activity.startActivity(intent)
+                    UrlSecurity.safeUri(url)?.let { uri ->
+                        activity.startActivity(
+                            android.content.Intent(android.content.Intent.ACTION_VIEW, uri)
+                        )
+                    }
                 }
             }
             IAMActionType.DEEP_LINK -> {
                 action.deepLink?.let { dl ->
-                    val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(dl))
-                    activity.startActivity(intent)
+                    UrlSecurity.safeUri(dl)?.let { uri ->
+                        activity.startActivity(
+                            android.content.Intent(android.content.Intent.ACTION_VIEW, uri)
+                        )
+                    }
                 }
             }
             IAMActionType.OUTCOME -> {
@@ -471,5 +565,9 @@ class InAppMessageController(
         } catch (e: IllegalArgumentException) {
             fallback
         }
+    }
+
+    private companion object {
+        const val TAG = "VP.InAppMessages"
     }
 }

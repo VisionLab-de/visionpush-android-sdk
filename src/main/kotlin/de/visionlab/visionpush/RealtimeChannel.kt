@@ -25,8 +25,13 @@ import java.util.concurrent.atomic.AtomicReference
  *    the API base URL (`http`→`ws`, `https`→`wss`).
  * 2. On open, the client immediately sends ONE text frame — the auth frame
  *    `{ "api_key", "installation_id", "app_id" }`.
- * 3. The server replies with text `{"type":"auth_ok"}` on success. On auth
- *    failure it CLOSES the socket with no frame.
+ * 3. The server replies with text `{"type":"auth_ok"}` on success. On rejection it
+ *    CLOSES the socket with a close frame whose code says why: `4401` (auth
+ *    rejected — bad key, or key not for this app) or `4404` (device unknown or
+ *    inactive). Both are TERMINAL: the channel logs a warning and does NOT
+ *    reconnect — retrying would just be rejected again, every ~22 s, forever. A
+ *    later explicit [connect] (e.g. `enableRealtime()` after re-registration)
+ *    tries again. Every other close keeps the back-off reconnect.
  * 4. Inbound push frames are text JSON
  *    `{"type":"push","installation_id":...,"payload": <object>}`; the `payload`
  *    is delivered to [onPush].
@@ -86,6 +91,16 @@ internal class RealtimeChannel(
     /** `true` once [disconnect] has been called — suppresses reconnects. */
     private val closedByUser = AtomicBoolean(false)
 
+    /**
+     * `true` after the server closed with a terminal code ([TERMINAL_CLOSE_CODES]) —
+     * suppresses reconnects until the next explicit [connect].
+     */
+    private val terminated = AtomicBoolean(false)
+
+    /** Close code of the most recent server-initiated close, or `-1` (diagnostics / tests). */
+    @Volatile internal var lastCloseCode: Int = -1
+        private set
+
     /** Guards against overlapping connect attempts. */
     private val connecting = AtomicBoolean(false)
 
@@ -97,6 +112,11 @@ internal class RealtimeChannel(
     /** Pending reconnect token (from [ReconnectScheduler]), if any. */
     @Volatile private var reconnectToken: Any? = null
 
+    /** notification_ids already delivered to [onPush] — dedups the at-least-once
+     *  owned transport into exactly-once display. Bounded (oldest evicted). Only
+     *  touched from [handlePush] on the serialized OkHttp reader thread. */
+    private val seenNotificationIds = LinkedHashSet<String>()
+
     // ── Public interface ─────────────────────────────────────────────────────
 
     /**
@@ -106,6 +126,7 @@ internal class RealtimeChannel(
      */
     fun connect() {
         closedByUser.set(false)
+        terminated.set(false) // an explicit connect() may retry after a terminal close
         if (state.get() == RealtimeConnectionState.OPEN && socket != null) return
         if (!connecting.compareAndSet(false, true)) return
         openSocket()
@@ -138,6 +159,12 @@ internal class RealtimeChannel(
 
     /** `true` when the channel is authenticated and online. */
     val isConnected: Boolean get() = state.get() == RealtimeConnectionState.OPEN
+
+    /**
+     * `true` when the gateway rejected this device with a terminal close code and the
+     * channel has therefore stopped reconnecting. Cleared by the next [connect].
+     */
+    val isTerminated: Boolean get() = terminated.get()
 
     // ── Socket lifecycle ─────────────────────────────────────────────────────
 
@@ -187,6 +214,7 @@ internal class RealtimeChannel(
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            if (webSocket === socket) lastCloseCode = code
             // Acknowledge the close so the connection finishes the handshake.
             try {
                 webSocket.close(NORMAL_CLOSURE, null)
@@ -195,12 +223,13 @@ internal class RealtimeChannel(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            handleDisconnected(webSocket)
+            handleDisconnected(webSocket, code, reason)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             VisionPushLogger.d(TAG, "Socket failure: ${t.message}")
-            handleDisconnected(webSocket)
+            // A transport failure carries no server close code → never terminal.
+            handleDisconnected(webSocket, closeCode = null, reason = t.message)
         }
     }
 
@@ -237,6 +266,26 @@ internal class RealtimeChannel(
             return
         }
         VisionPushLogger.d(TAG, "Push frame received")
+        // Ack EVERY delivery (Phase-2 at-least-once) so the gateway advances its
+        // cursor and stops redelivering — even a redelivered duplicate is acked. A
+        // dropped ack just makes the gateway fall back to the provider path. Frames
+        // with no notification_id are fire-and-forget. Confined to the OkHttp reader
+        // thread (onMessage is serialized), so the seen-set needs no extra locking.
+        if (frame.notificationId.isNotEmpty()) {
+            sendAck(frame.notificationId)
+            // Dedup DISPLAY: the at-least-once transport may redeliver the same
+            // notification_id (reconnect re-drain / missed-ack re-send) — fire onPush
+            // at most once. LinkedHashSet.add returns false for a repeat.
+            if (!seenNotificationIds.add(frame.notificationId)) {
+                VisionPushLogger.d(TAG, "Duplicate realtime push suppressed: ${frame.notificationId}")
+                return
+            }
+            if (seenNotificationIds.size > MAX_SEEN_NOTIFICATION_IDS) {
+                val it = seenNotificationIds.iterator()
+                it.next()
+                it.remove() // bounded — evict the oldest
+            }
+        }
         try {
             onPush(frame.payload, frame)
         } catch (e: Exception) {
@@ -245,16 +294,40 @@ internal class RealtimeChannel(
         }
     }
 
-    /** Shared teardown for `onClosed` / `onFailure`; schedules a reconnect. */
-    private fun handleDisconnected(webSocket: WebSocket) {
+    /** Sends a delivery ack `{type:"ack",notification_id}` back over the socket.
+     *  Best-effort — a dropped ack just means the gateway uses the provider fallback. */
+    private fun sendAck(notificationId: String) {
+        val ack = JSONObject().put("type", "ack").put("notification_id", notificationId)
+        socket?.send(ack.toString())
+    }
+
+    /**
+     * Shared teardown for `onClosed` / `onFailure`. Schedules a reconnect unless the
+     * user disconnected or the server sent a terminal close code.
+     *
+     * @param closeCode The server's close-frame status, or `null` for a transport failure.
+     */
+    private fun handleDisconnected(webSocket: WebSocket, closeCode: Int?, reason: String?) {
         if (webSocket !== socket) return // stale socket from a prior attempt
-        VisionPushLogger.d(TAG, "Socket disconnected")
+        VisionPushLogger.d(TAG, "Socket disconnected (code=${closeCode ?: "n/a"})")
+        if (closeCode != null) lastCloseCode = closeCode
         socket = null
         connecting.set(false)
         setState(RealtimeConnectionState.CLOSED)
 
         if (closedByUser.get()) {
             VisionPushLogger.d(TAG, "Not reconnecting — disconnect() was called")
+            return
+        }
+        if (closeCode != null && closeCode in TERMINAL_CLOSE_CODES) {
+            terminated.set(true)
+            // Logged ONCE per rejection — there is no reconnect loop to repeat it.
+            VisionPushLogger.w(
+                TAG,
+                "Realtime gateway rejected this device (close $closeCode: ${describeTerminalCode(closeCode)}" +
+                        (reason?.takeIf { it.isNotBlank() }?.let { ", \"$it\"" } ?: "") +
+                        ") – not reconnecting. Fix the API key / re-register the device, then call enableRealtime() again."
+            )
             return
         }
         scheduleReconnect()
@@ -266,12 +339,12 @@ internal class RealtimeChannel(
         if (reconnectToken != null) return // already scheduled
 
         val attempt = reconnectAttempts.getAndIncrement()
-        // Exponential: base * 2^attempt, capped, with up to ±50% jitter to avoid
-        // thundering-herd reconnects across many devices.
+        // Exponential base*2^attempt, capped, with EQUAL jitter: capped/2 + up to
+        // another capped/2 — always in [capped/2, capped], so it never overshoots
+        // the cap (the old ±50% reached 1.5× the cap, 45 s on a 30 s cap).
         val exponential = RECONNECT_BASE_MS.toDouble() * Math.pow(2.0, attempt.toDouble())
         val capped = exponential.coerceAtMost(RECONNECT_MAX_MS.toDouble())
-        val jitter = capped * (Math.random() - 0.5) // ±50%
-        val delay = (capped + jitter).toLong().coerceAtLeast(0)
+        val delay = (capped / 2 + Math.random() * (capped / 2)).toLong()
 
         VisionPushLogger.d(TAG, "Reconnecting in ${delay}ms (attempt ${attempt + 1})")
         reconnectToken = scheduler.schedule(delay) {
@@ -315,6 +388,28 @@ internal class RealtimeChannel(
         /** RFC 6455 normal-closure status code. */
         private const val NORMAL_CLOSURE = 1000
 
+        /** Gateway close code: auth rejected (bad key / key not for this app). Terminal. */
+        internal const val CLOSE_UNAUTHORIZED = 4401
+
+        /** Gateway close code: device unknown or inactive. Terminal. */
+        internal const val CLOSE_DEVICE_UNKNOWN = 4404
+
+        /**
+         * Server close codes after which reconnecting is pointless — the same request
+         * would be rejected again. Mirrors `device_gateway.rs` (`CLOSE_UNAUTHORIZED`,
+         * `CLOSE_DEVICE_UNKNOWN`).
+         */
+        internal val TERMINAL_CLOSE_CODES: Set<Int> = setOf(CLOSE_UNAUTHORIZED, CLOSE_DEVICE_UNKNOWN)
+
+        private fun describeTerminalCode(code: Int): String = when (code) {
+            CLOSE_UNAUTHORIZED -> "auth rejected"
+            CLOSE_DEVICE_UNKNOWN -> "device unknown or inactive"
+            else -> "terminal"
+        }
+
+        /** Cap on the realtime dedup set so it can't grow without bound. */
+        private const val MAX_SEEN_NOTIFICATION_IDS = 512
+
         /**
          * Derives the WebSocket URL from the configured REST API base URL:
          * `http`→`ws`, `https`→`wss`, then appends the gateway connect path.
@@ -341,10 +436,13 @@ enum class RealtimeConnectionState { CONNECTING, OPEN, CLOSED }
  * A parsed inbound `push` frame from the realtime gateway.
  *
  * @property installationId The device the frame is addressed to (may be empty).
+ * @property notificationId The frame's stable id (empty if absent) — used to ack the
+ *                          delivery and dedup duplicate (redelivered) displays.
  * @property payload        The notification content object delivered to the host.
  */
 data class RealtimePushFrame(
     val installationId: String,
+    val notificationId: String,
     val payload: JSONObject,
 ) {
     internal companion object {
@@ -355,6 +453,7 @@ data class RealtimePushFrame(
                 val payload = obj.optJSONObject("payload") ?: return null
                 RealtimePushFrame(
                     installationId = obj.optString("installation_id", ""),
+                    notificationId = obj.optString("notification_id", ""),
                     payload = payload,
                 )
             } catch (_: Exception) {

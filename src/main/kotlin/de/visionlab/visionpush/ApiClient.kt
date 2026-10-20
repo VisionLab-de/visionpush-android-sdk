@@ -10,6 +10,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import org.json.JSONObject
 import java.io.IOException
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
@@ -24,18 +25,53 @@ import java.util.concurrent.TimeUnit
  * the key provided during [VisionPush.initialize].
  */
 internal class ApiClient(
-    private val config: VisionPushConfig
+    private val config: VisionPushConfig,
+    clientOverride: OkHttpClient? = null
 ) {
 
     // ── HTTP client ─────────────────────────────────────────────────────────
+    //
+    // [clientOverride] lets unit tests inject an OkHttpClient whose single
+    // interceptor short-circuits the network with canned responses, exercising the
+    // retry/backoff logic in [execute] without any real I/O. Production callers pass
+    // no override and get the fully-configured client below.
+    //
+    // The auth interceptor is spliced in FIRST even on an override, so what the
+    // tests observe is what really goes on the wire. Appending it would be
+    // pointless: a canned-response interceptor short-circuits the chain before
+    // anything added after it ever runs, which is exactly why the auth headers
+    // used to be invisible to (and untestable by) the unit tests.
 
-    internal val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .writeTimeout(WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        .addInterceptor(buildAuthInterceptor())
-        .addInterceptor(buildLoggingInterceptor())
-        .build()
+    internal val httpClient: OkHttpClient = clientOverride
+        ?.newBuilder()
+        ?.apply { interceptors().add(0, buildAuthInterceptor()) }
+        ?.build()
+        ?: OkHttpClient.Builder()
+            .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .writeTimeout(WRITE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .addInterceptor(buildAuthInterceptor())
+            .addInterceptor(buildLoggingInterceptor())
+            .build()
+
+    // ── Device binding ──────────────────────────────────────────────────────
+
+    /**
+     * This installation's id, sent as `X-VisionPush-Installation-Id` on every
+     * request once it exists.
+     *
+     * A `client` API key is extractable from the APK, so on its own it only
+     * proves WHICH APP is calling. The installation id ([DeviceRegistrar]'s
+     * `anonymousId`: kept in this app's encrypted prefs, never handed to another
+     * user — unlike the device UUID, which the API returns) proves WHICH
+     * INSTALLATION, so a lifted key cannot act on another user's device.
+     *
+     * Late-bound and `@Volatile` rather than a constructor argument: the
+     * registrar that owns the id is built FROM this client, mints the id lazily,
+     * and the interceptor reads it from OkHttp's own threads.
+     */
+    @Volatile
+    internal var installationId: String? = null
 
     // ── Public API endpoints ────────────────────────────────────────────────
 
@@ -191,17 +227,48 @@ internal class ApiClient(
     /**
      * Sends a custom outcome event to POST `/devices/{id}/outcomes`.
      *
-     * @param deviceId Server-assigned device ID.
-     * @param name     Outcome identifier (e.g. "purchase_completed").
-     * @param value    Optional numeric value (e.g. purchase amount). Pass `null` for binary outcomes.
+     * The request is retried on network errors / 5xx (see [execute]). Because a lost
+     * *response* to a request the server did apply would otherwise duplicate the
+     * revenue row, every call carries an `idempotency_key` — generated ONCE per call
+     * (default argument) and baked into the single [Request] that all retry attempts
+     * reuse, so the server can dedup on `(device, key)`.
+     *
+     * @param deviceId       Server-assigned device ID.
+     * @param name           Outcome identifier (e.g. "purchase_completed").
+     * @param value          Optional numeric value (e.g. purchase amount). Pass `null` for binary outcomes.
+     * @param idempotencyKey Per-call dedup key (≤ 64 chars; a UUID by default).
      */
-    suspend fun sendOutcome(deviceId: String, name: String, value: Float? = null): VisionPushResult<Unit> {
+    suspend fun sendOutcome(
+        deviceId: String,
+        name: String,
+        value: Float? = null,
+        idempotencyKey: String = UUID.randomUUID().toString(),
+    ): VisionPushResult<Unit> {
+        require(idempotencyKey.isNotEmpty() && idempotencyKey.length <= MAX_IDEMPOTENCY_KEY_LENGTH) {
+            "idempotencyKey must be 1–$MAX_IDEMPOTENCY_KEY_LENGTH characters"
+        }
         val body = JSONObject().apply {
             put("name", name)
             put("device_id", deviceId)
-            if (value != null) put("value", value) else put("value", JSONObject.NULL)
+            // toDouble(): Kotlin resolves a Float to org.json's put(String, float), which
+            // exists in the org.json:json artifact but NOT in Android's platform org.json
+            // (which wins at runtime) → NoSuchMethodError on device. Double is universal.
+            if (value != null) put("value", value.toDouble()) else put("value", JSONObject.NULL)
+            put("idempotency_key", idempotencyKey)
         }
         return post(path = "/devices/$deviceId/outcomes", body = body).map { }
+    }
+
+    /**
+     * Clears the external-user association of the device identified by [deviceId].
+     * Sends a PUT to `/devices/{id}` with `{"clear_external_id": true}`.
+     *
+     * A separate call is required because the device upsert treats an omitted / null
+     * `external_id` as "leave unchanged" — omission alone can never clear it.
+     */
+    suspend fun clearExternalId(deviceId: String): VisionPushResult<Unit> {
+        val body = JSONObject().apply { put("clear_external_id", true) }
+        return put(path = "/devices/$deviceId", body = body).map { }
     }
 
     /**
@@ -291,8 +358,14 @@ internal class ApiClient(
      *
      * Retries on transient failures: [IOException] (network), 5xx server errors,
      * and 429 Too Many Requests. Non-retryable errors (4xx except 429) are returned
-     * immediately. Maximum [MAX_RETRIES] attempts with delays 500 ms → 1 s → 2 s
-     * (capped at [MAX_DELAY_MS]). 429 responses use a 2 s floor delay.
+     * immediately. Maximum [MAX_RETRIES] attempts with a 500 ms → 1 s → 2 s base
+     * (capped at [MAX_DELAY_MS]); the actual wait comes from [RetryBackoff]: the
+     * server's `Retry-After` header when present (capped at 60 s), otherwise the base
+     * with equal jitter, and never below a 2 s floor for 429.
+     *
+     * The same [Request] (and body) is re-sent on every attempt, so per-call values
+     * embedded in the body — e.g. an outcome's `idempotency_key` — are stable across
+     * retries by construction.
      */
     private suspend fun execute(request: Request): VisionPushResult<ApiResponse> =
         withContext(Dispatchers.IO) {
@@ -300,6 +373,7 @@ internal class ApiClient(
             var attempt = 0
             var result: VisionPushResult<ApiResponse>
             do {
+                var retryAfterMs: Long? = null
                 result = try {
                     val response = httpClient.newCall(request).execute()
                     val bodyString = response.body?.string() ?: "{}"
@@ -307,8 +381,15 @@ internal class ApiClient(
                     if (response.isSuccessful) {
                         VisionPushResult.Success(ApiResponse.fromJson(json))
                     } else {
-                        val message = json.optString("message", "Unexpected server error.")
-                        VisionPushResult.Failure(VisionPushError.ApiError(response.code, message))
+                        retryAfterMs = RetryBackoff.parseRetryAfterMs(response.header("Retry-After"))
+                        // Error bodies are either {"message": "..."} or a bare code
+                        // {"error": "<code>"} (e.g. external_id_verification_failed);
+                        // keep the code machine-readable instead of flattening it away.
+                        val errorCode = json.optString("error").takeIf { it.isNotBlank() }
+                        val message = json.optString("message").takeIf { it.isNotBlank() }
+                            ?: errorCode
+                            ?: "Unexpected server error."
+                        VisionPushResult.Failure(VisionPushError.ApiError(response.code, message, errorCode))
                     }
                 } catch (e: IOException) {
                     VisionPushResult.Failure(VisionPushError.NetworkError(e))
@@ -331,7 +412,12 @@ internal class ApiClient(
                 val isRateLimit = result is VisionPushResult.Failure &&
                         result.error is VisionPushError.ApiError &&
                         (result.error as VisionPushError.ApiError).httpStatus == 429
-                val waitMs = if (isRateLimit) maxOf(delayMs, RATE_LIMIT_DELAY_MS) else delayMs
+                val waitMs = RetryBackoff.delayMs(
+                    exponentialMs = delayMs,
+                    retryAfterMs = retryAfterMs,
+                    isRateLimit = isRateLimit,
+                    rateLimitFloorMs = RATE_LIMIT_DELAY_MS,
+                )
 
                 VisionPushLogger.d(TAG, "Request failed (attempt ${attempt + 1}/$MAX_RETRIES), retrying in ${waitMs}ms")
                 delay(waitMs)
@@ -343,16 +429,33 @@ internal class ApiClient(
 
     // ── Interceptors ────────────────────────────────────────────────────────
 
-    /** Injects authentication and content-type headers into every request. */
-    private fun buildAuthInterceptor() = okhttp3.Interceptor { chain ->
-        val request = chain.request().newBuilder()
+    /**
+     * Injects authentication and content-type headers into every request.
+     *
+     * `internal` so the unit tests, whose `clientOverride` replaces the whole
+     * OkHttpClient (and with it this interceptor), can install the real thing
+     * and assert on what actually goes on the wire.
+     */
+    internal fun buildAuthInterceptor() = okhttp3.Interceptor { chain ->
+        val builder = chain.request().newBuilder()
             .addHeader("Authorization", "Bearer ${config.apiKey}")
-            .addHeader("X-App-Id", config.appId)
+            // Diagnostic only — the server authorises from the Bearer key and
+            // reads the app id from the request body/query, never from a header.
+            // Named `X-App-Id` here while iOS and the web SDK send
+            // `X-VisionPush-App-Id`, so anything downstream (a WAF rule, an
+            // access-log dashboard, a future server-side read) silently saw
+            // Android as a different client. Aligned on the name the other two
+            // already use.
+            .addHeader("X-VisionPush-App-Id", config.appId)
             .addHeader("X-Sdk-Version", BuildConfig.VISIONPUSH_SDK_VERSION)
             .addHeader("Content-Type", JSON_MEDIA_TYPE.toString())
             .addHeader("Accept", JSON_MEDIA_TYPE.toString())
-            .build()
-        chain.proceed(request)
+        // Device binding — omitted (never sent blank) until the registrar has
+        // minted an id; the server tolerates that until the app opts in.
+        installationId?.takeIf { it.isNotBlank() }?.let {
+            builder.addHeader("X-VisionPush-Installation-Id", it)
+        }
+        chain.proceed(builder.build())
     }
 
     /** Logs request/response details according to the configured [VisionPushConfig.LogLevel]. */
@@ -382,6 +485,9 @@ internal class ApiClient(
         private const val INITIAL_DELAY_MS = 500L
         private const val MAX_DELAY_MS = 8_000L
         private const val RATE_LIMIT_DELAY_MS = 2_000L
+
+        /** Server-side limit for an outcome's `idempotency_key`. */
+        private const val MAX_IDEMPOTENCY_KEY_LENGTH = 64
 
         /** Converts a [JSONObject] to an OkHttp [okhttp3.RequestBody]. */
         private fun JSONObject.toRequestBody() =

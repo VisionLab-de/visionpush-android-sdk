@@ -53,10 +53,33 @@ sealed class VisionPushError(message: String, cause: Throwable? = null) :
      *
      * @property httpStatus HTTP status code returned by the server, or -1 if unknown.
      * @property message    Human-readable error message from the server response body.
+     * @property errorCode  Machine-readable code from the body's `error` field (e.g.
+     *                      [EXTERNAL_ID_VERIFICATION_FAILED]), or `null` when absent.
      */
-    class ApiError(val httpStatus: Int, override val message: String) : VisionPushError(
-        "API error $httpStatus: $message"
-    )
+    class ApiError @JvmOverloads constructor(
+        val httpStatus: Int,
+        override val message: String,
+        val errorCode: String? = null,
+    ) : VisionPushError("API error $httpStatus: $message") {
+
+        /**
+         * `true` for the server's HTTP 403 `external_id_verification_failed` rejection:
+         * identity verification is enabled for the app and the request that set
+         * `external_id` carried no — or a wrong — `external_id_hash`.
+         *
+         * The rejection is deterministic, so the SDK never retries it. Fix: call
+         * [VisionPush.setExternalId] with the hash your backend computed (lowercase hex
+         * HMAC-SHA256 of the external id, keyed with the app's identity secret).
+         */
+        val isExternalIdVerificationFailed: Boolean
+            get() = httpStatus == 403 &&
+                (errorCode == EXTERNAL_ID_VERIFICATION_FAILED || message.contains(EXTERNAL_ID_VERIFICATION_FAILED))
+
+        companion object {
+            /** Server error code for a rejected, unverified `external_id` (HTTP 403). */
+            const val EXTERNAL_ID_VERIFICATION_FAILED = "external_id_verification_failed"
+        }
+    }
 
     /**
      * The user denied the `POST_NOTIFICATIONS` runtime permission (API 33+) or

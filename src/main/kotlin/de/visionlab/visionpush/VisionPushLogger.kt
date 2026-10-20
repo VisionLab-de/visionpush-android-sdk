@@ -16,29 +16,34 @@ internal object VisionPushLogger {
     var minLevel: VisionPushConfig.LogLevel = VisionPushConfig.LogLevel.WARN
 
     fun v(tag: String, message: String) {
-        if (isLoggable(VisionPushConfig.LogLevel.VERBOSE)) Log.v(tag, message)
+        if (isEnabled(VisionPushConfig.LogLevel.VERBOSE)) Log.v(tag, message)
     }
 
     fun d(tag: String, message: String) {
-        if (isLoggable(VisionPushConfig.LogLevel.DEBUG)) Log.d(tag, message)
+        if (isEnabled(VisionPushConfig.LogLevel.DEBUG)) Log.d(tag, message)
     }
 
     fun i(tag: String, message: String) {
-        if (isLoggable(VisionPushConfig.LogLevel.INFO)) Log.i(tag, message)
+        if (isEnabled(VisionPushConfig.LogLevel.INFO)) Log.i(tag, message)
     }
 
     fun w(tag: String, message: String, throwable: Throwable? = null) {
-        if (isLoggable(VisionPushConfig.LogLevel.WARN)) {
+        if (isEnabled(VisionPushConfig.LogLevel.WARN)) {
             if (throwable != null) Log.w(tag, message, throwable) else Log.w(tag, message)
         }
     }
 
     fun e(tag: String, message: String, throwable: Throwable? = null) {
-        if (isLoggable(VisionPushConfig.LogLevel.ERROR)) {
+        if (isEnabled(VisionPushConfig.LogLevel.ERROR)) {
             if (throwable != null) Log.e(tag, message, throwable) else Log.e(tag, message)
         }
     }
 
-    private fun isLoggable(level: VisionPushConfig.LogLevel): Boolean =
+    /**
+     * SDK-level gate. Deliberately NOT named `isLoggable`: lint's LogTagMismatch check
+     * pairs any `isLoggable(x)` guard with the `Log.v(tag, …)` inside it and expects
+     * `x` to be the same tag — our argument is a level, not a tag.
+     */
+    private fun isEnabled(level: VisionPushConfig.LogLevel): Boolean =
         level.ordinal >= minLevel.ordinal
 }

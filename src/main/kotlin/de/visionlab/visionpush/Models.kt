@@ -1,6 +1,5 @@
 package de.visionlab.visionpush
 
-import android.net.Uri
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -203,14 +202,26 @@ internal data class DeviceRegistration(
     /** Algorithm tag for [sealedPubkey] (e.g. "p256-aes128gcm-ece"). */
     val sealedKeyAlg: String? = null,
     /** Auth secret (base64url) paired with [sealedPubkey] (RFC 8291). */
-    val sealedAuth: String? = null
+    val sealedAuth: String? = null,
+    /**
+     * Identity-verification hash for [externalId]: lowercase hex HMAC-SHA256 of the id,
+     * keyed with the app's identity secret — computed by the host app's BACKEND, never
+     * by the SDK. Required when identity verification is enabled for the app (the server
+     * rejects the registration with 403 `external_id_verification_failed` otherwise);
+     * ignored when it is disabled. Only sent together with a non-null [externalId].
+     */
+    val externalIdHash: String? = null
 ) : JsonSerializable {
     override fun toJson(): JSONObject = JSONObject().apply {
         put("app_id", appId)
         put("platform", platform)
         put("push_token", pushToken)
         put("environment", environment)
-        externalId?.let { put("external_id", it) }
+        externalId?.let {
+            put("external_id", it)
+            // Bound to the id — a hash is never sent on its own.
+            externalIdHash?.let { hash -> put("external_id_hash", hash) }
+        }
         put("installation_id", installationId)
         anonymousId?.let { put("anonymous_id", it) }
         put("device_model", deviceModel)
@@ -314,10 +325,10 @@ data class VisionPushNotification(
                 campaignId = json.optString("campaign_id").takeIf { it.isNotBlank() }?.take(512),
                 title = json.optString("title", "").take(256),
                 body = json.optString("body", "").take(4096),
-                imageUrl = json.optString("image_url").takeIf { it.isNotBlank() }?.let { safeHttpUrl(it) },
+                imageUrl = json.optString("image_url").takeIf { it.isNotBlank() }?.let { UrlSecurity.safeHttpUrl(it) },
                 smallIconName = json.optString("small_icon_name").takeIf { it.isNotBlank() }?.take(128),
-                largeIconUrl = json.optString("large_icon_url").takeIf { it.isNotBlank() }?.let { safeHttpUrl(it) },
-                deepLink = json.optString("deep_link").takeIf { it.isNotBlank() }?.let { safeDeepLink(it) },
+                largeIconUrl = json.optString("large_icon_url").takeIf { it.isNotBlank() }?.let { UrlSecurity.safeHttpUrl(it) },
+                deepLink = json.optString("deep_link").takeIf { it.isNotBlank() }?.let { UrlSecurity.safeDeepLink(it) },
                 channelId = json.optString("channel_id", VisionPushChannel.DEFAULT_CHANNEL_ID).take(128),
                 actions = actions.take(3),
                 customData = customData,
@@ -326,19 +337,8 @@ data class VisionPushNotification(
                 groupKey = json.optString("group_key").takeIf { it.isNotBlank() }?.take(128)
             )
         }
-
-        /** Returns the URL string only if its scheme is http or https. */
-        private fun safeHttpUrl(url: String): String? {
-            val scheme = try { Uri.parse(url).scheme?.lowercase() } catch (_: Exception) { null }
-            return if (scheme == "http" || scheme == "https") url else null
-        }
-
-        /** Returns the deep-link string unless its scheme is explicitly dangerous. */
-        private fun safeDeepLink(url: String): String? {
-            val blocked = setOf("javascript", "data", "vbscript", "content", "file")
-            val scheme = try { Uri.parse(url).scheme?.lowercase() } catch (_: Exception) { return null }
-            return if (scheme != null && !blocked.contains(scheme)) url else null
-        }
+        // URL vetting lives in [UrlSecurity] — the ONE scheme blocklist shared with the
+        // deep-link launch path and the in-app-message action path.
     }
 }
 
@@ -363,7 +363,9 @@ data class NotificationAction(
             return NotificationAction(
                 id = id,
                 title = title,
-                deepLink = json.optString("deep_link").takeIf { it.isNotBlank() },
+                // Per-action deep links are vetted with the same blocklist as the
+                // notification-level deep link (blocked schemes fall back to the app launch).
+                deepLink = json.optString("deep_link").takeIf { it.isNotBlank() }?.let { UrlSecurity.safeDeepLink(it) },
                 iconName = json.optString("icon_name").takeIf { it.isNotBlank() }
             )
         }

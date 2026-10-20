@@ -1,56 +1,81 @@
 package de.visionlab.visionpush
 
-import android.app.Application
-import org.robolectric.RuntimeEnvironment
+import android.app.Activity
+import android.os.Looper
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.time.Duration
 
 /**
- * InAppMessageController behavior tests running under Robolectric so that
- * Handler/Looper and Application lifecycle APIs are available on the JVM.
+ * InAppMessageController behaviour tests running under Robolectric so that
+ * Handler/Looper, Activity windows and AlertDialog are available on the JVM.
  *
- * present() fires onImpression synchronously before posting UI work to the
- * main looper, so all callback assertions complete without advancing the looper.
+ * Presentation is posted to the main looper, so tests call [idle] to let it run.
+ * `onImpression` fires only once a message is ACTUALLY on screen — never for an
+ * attempt that could not present (no activity, finishing activity) — so every
+ * impression assertion here needs a resumed activity plus an idled looper.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30])
 class InAppMessageControllerTest {
 
     private lateinit var controller: InAppMessageController
+    private val impressions = mutableListOf<String>()
+    private val dismissed = mutableListOf<String>()
 
     @Before
     fun setup() {
         val app = RuntimeEnvironment.getApplication()
         controller = InAppMessageController(app)
+        controller.onImpression = { id -> impressions.add(id) }
+        controller.onDismissed = { msg -> dismissed.add(msg.id) }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun makeMessage(id: String, triggerType: String, eventName: String? = null): InAppMessage {
+    private fun makeMessage(
+        id: String,
+        triggerType: String,
+        eventName: String? = null,
+        type: String = "modal",
+        dismissAfterSeconds: Double? = null,
+    ): InAppMessage {
         val trigger = JSONObject().apply {
             put("type", triggerType)
             if (eventName != null) put("value", eventName)
         }
         val json = JSONObject().apply {
             put("id", id)
-            put("type", "modal")
+            put("type", type)
             put("triggers", JSONArray().apply { put(trigger) })
+            if (dismissAfterSeconds != null) put("dismiss_after", dismissAfterSeconds)
         }
         return requireNotNull(InAppMessage.fromJson(json))
     }
+
+    /** Creates a resumed activity and tells the controller it is in the foreground. */
+    private fun resumeActivity(): Activity {
+        val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+        controller.onActivityResumed(activity)
+        return activity
+    }
+
+    private fun idle() = shadowOf(Looper.getMainLooper()).idle()
 
     // ── Queue management ──────────────────────────────────────────────────────
 
     @Test
     fun ingest_addsMessagesToQueue() {
-        val msg = makeMessage("m1", "manual")
-        controller.ingest(listOf(msg))
+        controller.ingest(listOf(makeMessage("m1", "manual")))
         assertEquals(1, controller.queuedMessageCount)
     }
 
@@ -67,33 +92,34 @@ class InAppMessageControllerTest {
     @Test
     fun queueCount_isZeroInitially() {
         assertEquals(0, controller.queuedMessageCount)
+        assertEquals(0, controller.deferredMessageCount)
     }
 
     // ── triggerSession ────────────────────────────────────────────────────────
 
     @Test
-    fun triggerSession_firesImpressionForSessionMessages() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+    fun triggerSession_billsImpressionOnlyOnceTheMessageIsOnScreen() {
+        resumeActivity()
         controller.ingest(listOf(makeMessage("m1", "on_session")))
         controller.triggerSession()
 
-        assertEquals(listOf("m1"), presentedIds)
+        assertTrue("not on screen yet — presentation is posted", impressions.isEmpty())
+        idle()
+        assertEquals(listOf("m1"), impressions)
     }
 
     @Test
     fun triggerSession_doesNotFireForNonSessionMessages() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+        resumeActivity()
         controller.ingest(listOf(
             makeMessage("m1", "on_notification_open"),
             makeMessage("m2", "manual")
         ))
         controller.triggerSession()
+        idle()
 
-        assertTrue(presentedIds.isEmpty())
+        assertTrue(impressions.isEmpty())
+        assertEquals(2, controller.queuedMessageCount)
     }
 
     @Test
@@ -107,68 +133,72 @@ class InAppMessageControllerTest {
     }
 
     @Test
-    fun triggerSession_firesFirstEligibleMessage_showsOneAtATime() {
-        // The controller only presents one message at a time.
-        // The second session-message is re-queued because isPresenting is true.
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+    fun onlyOneMessageAtATime_secondIsDeferredUntilTheFirstIsDismissed() {
+        resumeActivity()
         controller.ingest(listOf(
             makeMessage("m1", "on_session"),
             makeMessage("m2", "on_session"),
             makeMessage("m3", "on_notification_open")
         ))
         controller.triggerSession()
+        idle()
 
-        assertEquals(listOf("m1"), presentedIds)
+        assertEquals(listOf("m1"), impressions)
+        assertEquals("m2 waits behind m1", 1, controller.deferredMessageCount)
+        assertEquals("m2 deferred + m3 waiting for its trigger", 2, controller.queuedMessageCount)
+
+        // Dismissing m1 drains m2 — the re-queued message is presented, not stranded.
+        controller.dismissCurrent()
+        idle()
+
+        assertEquals(listOf("m1", "m2"), impressions)
+        assertEquals(listOf("m1"), dismissed)
+        assertEquals(0, controller.deferredMessageCount)
+        assertEquals(1, controller.queuedMessageCount)
     }
 
     // ── triggerNotificationOpen ───────────────────────────────────────────────
 
     @Test
     fun triggerNotificationOpen_firesImpressionForMatchingMessages() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+        resumeActivity()
         controller.ingest(listOf(makeMessage("m1", "on_notification_open")))
         controller.triggerNotificationOpen()
+        idle()
 
-        assertEquals(listOf("m1"), presentedIds)
+        assertEquals(listOf("m1"), impressions)
     }
 
     @Test
     fun triggerNotificationOpen_doesNotFireForSessionMessages() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+        resumeActivity()
         controller.ingest(listOf(makeMessage("m1", "on_session")))
         controller.triggerNotificationOpen()
+        idle()
 
-        assertTrue(presentedIds.isEmpty())
+        assertTrue(impressions.isEmpty())
     }
 
     // ── triggerCustomEvent ────────────────────────────────────────────────────
 
     @Test
     fun triggerCustomEvent_firesImpressionForMatchingEvent() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+        resumeActivity()
         controller.ingest(listOf(makeMessage("m1", "custom_event", "purchase_completed")))
         controller.triggerCustomEvent("purchase_completed")
+        idle()
 
-        assertEquals(listOf("m1"), presentedIds)
+        assertEquals(listOf("m1"), impressions)
     }
 
     @Test
     fun triggerCustomEvent_doesNotFireForDifferentEventName() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+        resumeActivity()
         controller.ingest(listOf(makeMessage("m1", "custom_event", "purchase_completed")))
         controller.triggerCustomEvent("tutorial_finished")
+        idle()
 
-        assertTrue(presentedIds.isEmpty())
+        assertTrue(impressions.isEmpty())
     }
 
     @Test
@@ -186,16 +216,15 @@ class InAppMessageControllerTest {
 
     @Test
     fun presentMessage_firesImpressionForRequestedId() {
-        var impressionId: String? = null
-        controller.onImpression = { id -> impressionId = id }
-
+        resumeActivity()
         controller.ingest(listOf(
             makeMessage("m1", "manual"),
             makeMessage("m2", "manual")
         ))
         controller.presentMessage("m2")
+        idle()
 
-        assertEquals("m2", impressionId)
+        assertEquals(listOf("m2"), impressions)
     }
 
     @Test
@@ -211,74 +240,122 @@ class InAppMessageControllerTest {
 
     @Test
     fun presentMessage_doesNothingForUnknownId() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+        resumeActivity()
         controller.ingest(listOf(makeMessage("m1", "manual")))
         controller.presentMessage("nonexistent")
+        idle()
 
-        assertTrue(presentedIds.isEmpty())
+        assertTrue(impressions.isEmpty())
         assertEquals(1, controller.queuedMessageCount)
+    }
+
+    // ── Impressions are billed only for a real presentation ──────────────────
+
+    @Test
+    fun impression_notBilledWithoutAForegroundActivity() {
+        controller.ingest(listOf(makeMessage("m1", "on_session")))
+        controller.triggerSession()
+        idle()
+
+        assertTrue("nothing was shown → nothing billed", impressions.isEmpty())
+        assertEquals("the message is parked, not lost", 1, controller.deferredMessageCount)
+    }
+
+    @Test
+    fun deferredMessage_isPresentedWhenAnActivityResumes() {
+        controller.ingest(listOf(makeMessage("m1", "on_session")))
+        controller.triggerSession()
+        idle()
+        assertTrue(impressions.isEmpty())
+
+        resumeActivity() // drains the deferred queue
+        idle()
+
+        assertEquals(listOf("m1"), impressions)
+        assertEquals(0, controller.deferredMessageCount)
+    }
+
+    @Test
+    fun impression_notBilledWhenTheActivityIsFinishing() {
+        val activity = resumeActivity()
+        activity.finish()
+        controller.ingest(listOf(makeMessage("m1", "on_session")))
+        controller.triggerSession()
+        idle()
+
+        assertTrue(impressions.isEmpty())
+        assertEquals(1, controller.deferredMessageCount)
+    }
+
+    @Test
+    fun banner_billsImpressionOnceAttached() {
+        resumeActivity()
+        controller.ingest(listOf(makeMessage("b1", "on_session", type = "banner")))
+        controller.triggerSession()
+        assertTrue(impressions.isEmpty())
+        idle()
+
+        assertEquals(listOf("b1"), impressions)
+    }
+
+    @Test
+    fun dismissAfter_autoDismissesTheModalAndDrainsTheNextMessage() {
+        resumeActivity()
+        controller.ingest(listOf(
+            makeMessage("m1", "on_session", dismissAfterSeconds = 1.0),
+            makeMessage("m2", "on_session")
+        ))
+        controller.triggerSession()
+        idle()
+        assertEquals(listOf("m1"), impressions)
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(1_100))
+
+        assertEquals(listOf("m1"), dismissed)
+        assertEquals(listOf("m1", "m2"), impressions)
+    }
+
+    @Test
+    fun dismissCurrent_withNothingOnScreenIsANoOp() {
+        controller.dismissCurrent()
+        idle()
+        assertTrue(impressions.isEmpty())
+        assertTrue(dismissed.isEmpty())
+    }
+
+    @Test
+    fun dismissCurrent_firesOnDismissedForTheShownMessage() {
+        resumeActivity()
+        controller.ingest(listOf(makeMessage("m1", "on_session")))
+        controller.triggerSession()
+        idle()
+
+        controller.dismissCurrent()
+        idle()
+
+        assertEquals(listOf("m1"), dismissed)
+        assertEquals(0, controller.deferredMessageCount)
     }
 
     // ── Impression callback ───────────────────────────────────────────────────
 
     @Test
     fun impressionCallback_notFiredWhenQueueIsEmpty() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
-
+        resumeActivity()
         controller.triggerSession()
+        idle()
 
-        assertTrue(presentedIds.isEmpty())
+        assertTrue(impressions.isEmpty())
     }
 
     @Test
     fun impressionCallback_canBeCleared() {
-        val presentedIds = mutableListOf<String>()
-        controller.onImpression = { id -> presentedIds.add(id) }
         controller.onImpression = null
-
+        resumeActivity()
         controller.ingest(listOf(makeMessage("m1", "on_session")))
         controller.triggerSession()
+        idle()
 
-        assertTrue(presentedIds.isEmpty())
-    }
-
-    // ── VisionPushNotification URL validation (requires Android runtime) ──────
-
-    @Test
-    fun visionPushNotification_allowsHttpsImageUrl() {
-        val payload = """{"id":"n1","title":"T","image_url":"https://example.com/img.jpg"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertEquals("https://example.com/img.jpg", n?.imageUrl)
-    }
-
-    @Test
-    fun visionPushNotification_blocksDataSchemeImageUrl() {
-        val payload = """{"id":"n2","title":"T","image_url":"data:image/png;base64,abc"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertNull(n?.imageUrl)
-    }
-
-    @Test
-    fun visionPushNotification_allowsCustomSchemeDeepLink() {
-        val payload = """{"id":"n3","title":"T","deep_link":"myapp://home"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertEquals("myapp://home", n?.deepLink)
-    }
-
-    @Test
-    fun visionPushNotification_blocksJavascriptDeepLink() {
-        val payload = """{"id":"n4","title":"T","deep_link":"javascript:alert(1)"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertNull(n?.deepLink)
-    }
-
-    @Test
-    fun visionPushNotification_blocksFileSchemeDeepLink() {
-        val payload = """{"id":"n5","title":"T","deep_link":"file:///etc/passwd"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertNull(n?.deepLink)
+        assertTrue(impressions.isEmpty())
     }
 }

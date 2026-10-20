@@ -317,7 +317,7 @@ class VisionPushSDKTest {
             hasConsent = true,
             consentRequired = false,
             apiKeyPrefix = "vp_live_",
-            apiBaseUrl = "https://api.visionpush.io/v1",
+            apiBaseUrl = "https://api.visionpush.de/v1",
             networkReachable = true,
             subscribedTopics = listOf("news", "sports"),
             cachedTagCount = 3,
@@ -343,7 +343,7 @@ class VisionPushSDKTest {
             hasConsent = false,
             consentRequired = true,
             apiKeyPrefix = "vp_test_",
-            apiBaseUrl = "https://api.visionpush.io/v1",
+            apiBaseUrl = "https://api.visionpush.de/v1",
             networkReachable = false,
             subscribedTopics = emptyList(),
             cachedTagCount = 0,
@@ -484,36 +484,10 @@ class VisionPushSDKTest {
         assertNull(n)
     }
 
-    @Test
-    fun visionPushNotification_blocksJavascriptDeepLink() {
-        val payload = """{"id":"n3","title":"T","deep_link":"javascript:alert(1)"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertNull(n?.deepLink)
-    }
-
-    @Test
-    fun visionPushNotification_blocksDataUrlInImageUrl() {
-        val payload = """{"id":"n4","title":"T","image_url":"data:image/png;base64,abc"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertNull(n?.imageUrl)
-    }
-
-    @Test
-    fun visionPushNotification_blocksFileSchemeDeepLink() {
-        val payload = """{"id":"n5","title":"T","deep_link":"file:///etc/passwd"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertNull(n?.deepLink)
-    }
-
-    @Test
-    fun visionPushNotification_imageUrlIsNullWithoutAndroidRuntime() {
-        // android.net.Uri is a stub in pure JVM tests — safeHttpUrl() catches the exception
-        // and returns null. URL validation is exercised in InAppMessageControllerTest (Robolectric).
-        val payload = """{"id":"n6","title":"T","image_url":"https://example.com/img.jpg"}"""
-        val n = VisionPushNotification.fromFcmData(mapOf("vp_payload" to payload))
-        assertNotNull(n)            // notification is parsed
-        assertEquals("n6", n?.id)  // non-URL fields are fine
-    }
+    // NOTE: URL-scheme blocking (javascript:/data:/file: deep links + image URLs) is NOT
+    // tested here on purpose. `android.net.Uri` is a stub on the plain JVM, so every URL
+    // parses to null and an assertNull would pass with the blocklist deleted. Those
+    // tests live in NotificationUrlSecurityTest (Robolectric) with positive controls.
 
     @Test
     fun visionPushNotification_truncatesOversizedId() {
@@ -558,6 +532,66 @@ class VisionPushSDKTest {
         } catch (e: VisionPushError.InvalidArgument) {
             fail("Should not throw InvalidArgument for exactly 1024 chars")
         }
+    }
+
+    // ── Identity verification: externalIdHash ────────────────────────────────
+
+    @Test
+    fun setExternalId_rejectsAMalformedHashBeforeAnythingElse() {
+        try {
+            VisionPush.setExternalId("user", "not-a-hash")
+            fail("Expected VisionPushError.InvalidArgument")
+        } catch (e: VisionPushError.InvalidArgument) {
+            assertTrue("the message must say what the hash is", requireNotNull(e.message).contains("HMAC-SHA256"))
+        }
+    }
+
+    @Test
+    fun setExternalId_validHashPassesValidationThenThrowsNotInitialized() {
+        try {
+            VisionPush.setExternalId("user", "0F".repeat(32))
+            fail("Expected an exception")
+        } catch (e: VisionPushError.NotInitialized) {
+            // correct: validation passed (upper-case hex is normalised, not rejected)
+        } catch (e: VisionPushError.InvalidArgument) {
+            fail("a 64-hex-char hash must be accepted")
+        }
+    }
+
+    @Test
+    fun setExternalId_nullIdIgnoresTheHash() {
+        // Clearing never needs a hash — a stray one must not turn a logout into an error.
+        try {
+            VisionPush.setExternalId(null, "garbage")
+            fail("Expected an exception")
+        } catch (e: VisionPushError.NotInitialized) {
+            // correct: the hash was ignored, not validated
+        }
+    }
+
+    @Test
+    fun normalizeExternalIdHash_trimsLowercasesAndRejectsNonHmacInput() {
+        val hash = "ab".repeat(32)
+        assertNull(VisionPush.normalizeExternalIdHash(null))
+        assertNull("blank means none", VisionPush.normalizeExternalIdHash("   "))
+        assertEquals(hash, VisionPush.normalizeExternalIdHash(" ${hash.uppercase()}\n"))
+        for (bad in listOf("abc", "z".repeat(64), hash + "0", "the-identity-secret-itself")) {
+            try {
+                VisionPush.normalizeExternalIdHash(bad)
+                fail("expected InvalidArgument for '$bad'")
+            } catch (_: VisionPushError.InvalidArgument) {
+            }
+        }
+    }
+
+    @Test
+    fun apiError_detectsTheExternalIdVerificationRejection() {
+        val code = VisionPushError.ApiError.EXTERNAL_ID_VERIFICATION_FAILED
+        assertTrue(VisionPushError.ApiError(403, code, code).isExternalIdVerificationFailed)
+        assertTrue("message-only bodies still match", VisionPushError.ApiError(403, code).isExternalIdVerificationFailed)
+        assertFalse(VisionPushError.ApiError(403, "forbidden", "forbidden").isExternalIdVerificationFailed)
+        assertFalse("only a 403", VisionPushError.ApiError(400, code, code).isExternalIdVerificationFailed)
+        assertNull("the two-arg constructor stays source-compatible", VisionPushError.ApiError(404, "Not found").errorCode)
     }
 
     @Test

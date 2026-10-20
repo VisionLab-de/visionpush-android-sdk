@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    VisionPush Android SDK – data extraction rules (Android 12+, `android:dataExtractionRules`).
+
+    Same files as visionpush_backup_rules.xml, for both cloud backup and device-to-device
+    transfer. Not referenced from the SDK manifest (single-attribute merge conflict with a
+    host that declares its own rules) — copy the <exclude> lines into YOUR rules file.
+    See README.md "Backup & Restore".
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="visionpush_device.xml" />
+        <exclude domain="sharedpref" path="visionpush_device_plain.xml" />
+        <exclude domain="sharedpref" path="__androidx_security_crypto_encrypted_prefs_key_keyset__.xml" />
+        <exclude domain="sharedpref" path="__androidx_security_crypto_encrypted_prefs_value_keyset__.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="visionpush_device.xml" />
+        <exclude domain="sharedpref" path="visionpush_device_plain.xml" />
+        <exclude domain="sharedpref" path="__androidx_security_crypto_encrypted_prefs_key_keyset__.xml" />
+        <exclude domain="sharedpref" path="__androidx_security_crypto_encrypted_prefs_value_keyset__.xml" />
+    </device-transfer>
+</data-extraction-rules>

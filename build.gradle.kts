@@ -11,6 +11,9 @@ plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
     id("maven-publish")
+    // Maven Central via the modern Central Portal (handles signing + sources/javadoc
+    // jars + the staging upload). See PUBLISHING.md for the required account/keys.
+    id("com.vanniktech.maven.publish") version "0.30.0"
     id("org.jetbrains.dokka")
 }
 
@@ -23,7 +26,7 @@ android {
         targetSdk = 34
 
         // SDK version constants injected into BuildConfig at compile time
-        buildConfigField("String", "VISIONPUSH_SDK_VERSION", "\"1.0.0\"")
+        buildConfigField("String", "VISIONPUSH_SDK_VERSION", "\"1.1.0\"")
         buildConfigField("String", "VISIONPUSH_DEFAULT_API_BASE_URL", "\"https://api.visionpush.de/v1\"")
 
         consumerProguardFiles("consumer-rules.pro")
@@ -46,6 +49,18 @@ android {
         buildConfig = true
     }
 
+    lint {
+        // Lint is a CI gate (.github/workflows/ci.yml → test-android-sdk): any error
+        // fails the build. No baseline file on purpose — findings get fixed, not
+        // banked. Warnings are reported (build/reports/lint-results-debug.*) but do
+        // not fail the build.
+        abortOnError = true
+        warningsAsErrors = false
+        xmlReport = true
+        htmlReport = true
+        textReport = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -57,12 +72,10 @@ android {
         freeCompilerArgs += listOf("-Xjvm-default=all")
     }
 
-    publishing {
-        singleVariant("release") {
-            withSourcesJar()
-            withJavadocJar()
-        }
-    }
+    // NOTE: no android.publishing.singleVariant block here — the vanniktech
+    // maven-publish plugin (see mavenPublishing below) configures the release
+    // variant with sources + javadoc itself; declaring it twice fails the build
+    // ("singleVariant publishing DSL multiple times" on AGP 8.x).
 }
 
 dependencies {
@@ -94,11 +107,20 @@ dependencies {
     // ── Encrypted storage for sensitive SDK state (FCM token, device ID) ─────
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
-    // ── JSON serialisation (lightweight, zero-dependency) ────────────────────
-    implementation("org.json:json:20231013")
+    // ── JSON: main code uses the Android PLATFORM org.json only ─────────────
+    // `org.json:json` is deliberately TEST-ONLY (see the unit-test block below).
+    // Android ships its own org.json under the very same class names, and that
+    // copy always wins on-device; the Maven artifact merely shadowed it at compile
+    // time — and once hid a real NoSuchMethodError: JSONObject.put(String, float)
+    // exists in the artifact but NOT on Android (lint: DuplicatePlatformClasses).
+    // Compiling main against android.jar alone turns such mismatches into compile
+    // errors instead of production crashes.
 
     // ── Unit tests ────────────────────────────────────────────────────────────
     testImplementation("junit:junit:4.13.2")
+    // Pure-JVM tests (no Robolectric) need a real org.json instead of android.jar's
+    // throwing stubs; Robolectric tests keep using the android-all platform copy.
+    testImplementation("org.json:json:20231013")
     testImplementation("org.mockito.kotlin:mockito-kotlin:5.2.1")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
     testImplementation("org.robolectric:robolectric:4.11.1")
@@ -123,54 +145,52 @@ tasks.withType<org.jetbrains.dokka.gradle.DokkaTask>().configureEach {
     }
 }
 
-// ── Maven publication (for local/private Maven repository consumption) ────────
-publishing {
-    publications {
-        register<MavenPublication>("release") {
-            groupId = "de.visionlab"
-            artifactId = "visionpush-android"
-            version = "1.0.0"
+// ── Maven Central (Central Portal) via the vanniktech plugin ──────────────────
+// Creates the release publication with sources + javadoc jars, GPG-signs every
+// artifact, and uploads to the Sonatype Central Portal. Credentials + the signing
+// key are supplied via env vars / gradle properties at publish time — see
+// PUBLISHING.md. Run: ./gradlew publishToMavenCentral   (or publishAndReleaseToMavenCentral)
+mavenPublishing {
+    publishToMavenCentral(com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    // Sign only when a key is actually configured (Central requires it; a local
+    // `publishToMavenLocal` for dev verification must not fail on a missing key).
+    if (project.hasProperty("signingInMemoryKey") || project.hasProperty("signing.keyId")) {
+        signAllPublications()
+    }
+    coordinates("de.visionlab", "visionpush-android", "1.1.0")
 
-            afterEvaluate {
-                from(components["release"])
-            }
-
-            pom {
-                name.set("VisionPush Android SDK")
-                description.set("Official Android SDK for the VisionPush push notification service.")
-                url.set("https://visionpush.de")
-
-                licenses {
-                    license {
-                        name.set("MIT License")
-                        url.set("https://opensource.org/licenses/MIT")
-                    }
-                }
-
-                developers {
-                    developer {
-                        id.set("visionlab")
-                        name.set("VisionLab GmbH")
-                        email.set("sdk@visionpush.de")
-                    }
-                }
-
-                // Required by Maven Central. Points at the public SDK mirror repo.
-                scm {
-                    url.set("https://github.com/VisionLab-de/visionpush-android-sdk")
-                    connection.set("scm:git:https://github.com/VisionLab-de/visionpush-android-sdk.git")
-                    developerConnection.set("scm:git:ssh://git@github.com/VisionLab-de/visionpush-android-sdk.git")
-                }
+    pom {
+        name.set("VisionPush Android SDK")
+        description.set("Official Android SDK for the VisionPush push notification service.")
+        url.set("https://visionpush.de")
+        licenses {
+            license {
+                name.set("MIT License")
+                url.set("https://opensource.org/licenses/MIT")
             }
         }
+        developers {
+            developer {
+                id.set("visionlab")
+                name.set("VisionLab GmbH & Co. KG")
+                email.set("sdk@visionpush.de")
+            }
+        }
+        scm {
+            url.set("https://github.com/VisionLab-de/visionpush-android-sdk")
+            connection.set("scm:git:https://github.com/VisionLab-de/visionpush-android-sdk.git")
+            developerConnection.set("scm:git:ssh://git@github.com/VisionLab-de/visionpush-android-sdk.git")
+        }
     }
+}
 
+// ── Secondary target: GitHub Packages (optional) ──────────────────────────────
+// The vanniktech plugin creates the publication; this just adds GitHub Packages +
+// the local cache as extra repositories to publish it to. Credentials via
+// GITHUB_ACTOR / GITHUB_TOKEN (CI) or gpr.user / gpr.token (gradle.properties).
+publishing {
     repositories {
-        // Local Maven cache — useful for host-app integration testing.
         mavenLocal()
-
-        // GitHub Packages — published automatically by the sdk-release workflow.
-        // Credentials are injected via GITHUB_ACTOR / GITHUB_TOKEN env vars in CI.
         maven {
             name = "GitHubPackages"
             url = uri("https://maven.pkg.github.com/visionlab-de/visionpush")

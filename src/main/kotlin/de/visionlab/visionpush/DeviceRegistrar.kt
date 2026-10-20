@@ -38,25 +38,42 @@ internal class DeviceRegistrar(
 
     // ── Shared preferences ──────────────────────────────────────────────────
 
+    /**
+     * `true` when [prefs] is the plain fallback file because EncryptedSharedPreferences
+     * could not be opened. The typical cause is a backup restore: the Keystore master
+     * key does not travel with the backup, so the restored encrypted file is
+     * unreadable and the SDK starts from an EMPTY store — new installation id, new
+     * sealed keys. Non-secret state (opt-out) is kept in [statePrefs] so it survives.
+     */
+    @Volatile internal var usingFallbackStorage: Boolean = false
+        private set
+
     private val prefs: SharedPreferences by lazy {
-        try {
-            val masterKey = MasterKey.Builder(context)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                context,
-                PREFS_FILE_NAME,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
-        } catch (e: Exception) {
+        openEncryptedPrefs(context) { e ->
             // Fallback: some vendor ROMs or very old devices may fail to provision the
-            // Android Keystore. Plain SharedPreferences is still MODE_PRIVATE (no other
-            // app can read it without root), so this is an acceptable degradation.
-            VisionPushLogger.w(TAG, "EncryptedSharedPreferences unavailable – using plain storage: ${e.message}")
-            context.getSharedPreferences("${PREFS_FILE_NAME}_plain", Context.MODE_PRIVATE)
+            // Android Keystore, and a backup restore leaves the encrypted file without
+            // its master key. Plain SharedPreferences is still MODE_PRIVATE (no other
+            // app can read it without root). This is NOT silent: the device identity is
+            // lost, so log at ERROR — hosts that ship the SDK's backup exclusion rules
+            // (see README "Backup & Restore") avoid the restore case entirely.
+            usingFallbackStorage = true
+            VisionPushLogger.e(
+                TAG,
+                "EncryptedSharedPreferences unavailable – falling back to plain storage. " +
+                        "Installation id and sealed keys will be regenerated (a new device row); " +
+                        "the opt-out state is restored from the plain state file. Cause: ${e.message}",
+                e
+            )
         }
+    }
+
+    /**
+     * Non-secret registration state kept OUTSIDE the encrypted file (plain,
+     * MODE_PRIVATE) so it survives a lost master key. Currently: the opt-out flag —
+     * an opted-out user must never be silently re-subscribed by a restore.
+     */
+    private val statePrefs: SharedPreferences by lazy {
+        context.getSharedPreferences(STATE_PREFS_FILE_NAME, Context.MODE_PRIVATE)
     }
 
     // ── Registration state accessors ────────────────────────────────────────
@@ -71,15 +88,105 @@ internal class DeviceRegistrar(
         get() = prefs.getString(KEY_DEVICE_ID, null)
         private set(value) = prefs.edit().putString(KEY_DEVICE_ID, value).apply()
 
-    /** Caller-supplied external user identifier (nullable). */
+    /**
+     * Caller-supplied external user identifier (nullable).
+     *
+     * Setting `null` after a non-null value marks a server-side clear as pending
+     * ([isExternalIdClearPending]): the register upsert treats an omitted
+     * `external_id` as "unchanged", so the next [register] first sends an explicit
+     * `PUT /devices/{id} {"clear_external_id": true}`.
+     */
     internal var externalId: String?
         get() = prefs.getString(KEY_EXTERNAL_ID, null)
-        set(value) = prefs.edit().putString(KEY_EXTERNAL_ID, value).apply()
+        set(value) = setExternalIdentity(value, hash = null)
 
-    /** Whether the user has explicitly opted out of push notifications. */
+    /**
+     * The identity-verification hash stored next to [externalId] (same encrypted store,
+     * same lifetime: wiped by [clearLocalState]). Re-sent with the id on every
+     * registration — e.g. after an FCM token rotation — so a verified association
+     * survives re-registration. `null` when the host never supplied one.
+     */
+    internal val externalIdHash: String?
+        get() = prefs.getString(KEY_EXTERNAL_ID_HASH, null)
+
+    /**
+     * Persists [externalId] together with its identity-verification [hash] in ONE edit,
+     * so a crash between two writes can never leave a hash that belongs to a different
+     * id. A hash is bound to its id: it is stored only alongside a non-null id, and
+     * setting an id WITHOUT a hash drops any previously stored one (it would be wrong
+     * for the new id anyway). Clearing (`null`) marks the explicit server-side clear as
+     * pending exactly like the [externalId] setter always did.
+     */
+    internal fun setExternalIdentity(externalId: String?, hash: String?) {
+        val previous = prefs.getString(KEY_EXTERNAL_ID, null)
+        val editor = prefs.edit().putString(KEY_EXTERNAL_ID, externalId)
+        if (externalId != null && hash != null) {
+            editor.putString(KEY_EXTERNAL_ID_HASH, hash)
+        } else {
+            editor.remove(KEY_EXTERNAL_ID_HASH)
+        }
+        if (externalId == null) {
+            if (previous != null) editor.putBoolean(KEY_EXTERNAL_ID_CLEAR_PENDING, true)
+        } else {
+            editor.putBoolean(KEY_EXTERNAL_ID_CLEAR_PENDING, false)
+        }
+        editor.apply()
+    }
+
+    /**
+     * Sets (or clears) the external identity and pushes it to the backend right away.
+     *
+     * When the server rejects the id with 403 `external_id_verification_failed` (identity
+     * verification enabled, hash missing/wrong) the PREVIOUS identity is restored locally:
+     * the device keeps its last accepted association and stays syncable, instead of
+     * re-sending an unverifiable id on every later sync. The failure is returned as-is —
+     * [ApiClient] never retries a 4xx other than 429.
+     */
+    suspend fun updateExternalIdentity(externalId: String?, hash: String?): VisionPushResult<String> {
+        val previous = ExternalIdentitySnapshot(this.externalId, externalIdHash, isExternalIdClearPending)
+        setExternalIdentity(externalId, hash)
+        val result = register(forceRefresh = true)
+        val error = result.errorOrNull() as? VisionPushError.ApiError
+        if (error?.isExternalIdVerificationFailed == true) {
+            prefs.edit()
+                .putString(KEY_EXTERNAL_ID, previous.externalId)
+                .putString(KEY_EXTERNAL_ID_HASH, previous.hash)
+                .putBoolean(KEY_EXTERNAL_ID_CLEAR_PENDING, previous.clearPending)
+                .apply()
+            VisionPushLogger.w(
+                TAG,
+                "Restored the previous external identity (${previous.externalId ?: "none"}) after the rejection."
+            )
+        }
+        return result
+    }
+
+    /** Immutable capture of the external identity, for rollback after a rejection. */
+    private data class ExternalIdentitySnapshot(val externalId: String?, val hash: String?, val clearPending: Boolean)
+
+    /** `true` while a `setExternalId(null)` still has to be pushed to the backend. */
+    internal var isExternalIdClearPending: Boolean
+        get() = prefs.getBoolean(KEY_EXTERNAL_ID_CLEAR_PENDING, false)
+        private set(value) = prefs.edit().putBoolean(KEY_EXTERNAL_ID_CLEAR_PENDING, value).apply()
+
+    /**
+     * Whether the user has explicitly opted out of push notifications.
+     *
+     * Written to BOTH the (encrypted) [prefs] and the plain [statePrefs]; read from the
+     * encrypted store when it holds a value, otherwise from the plain one — so after
+     * the encrypted store is lost (see [usingFallbackStorage]) the opt-out is
+     * preserved instead of silently reverting to opted-in.
+     */
     internal var isOptedOut: Boolean
-        get() = prefs.getBoolean(KEY_OPTED_OUT, false)
-        set(value) = prefs.edit().putBoolean(KEY_OPTED_OUT, value).apply()
+        get() = if (prefs.contains(KEY_OPTED_OUT)) {
+            prefs.getBoolean(KEY_OPTED_OUT, false)
+        } else {
+            statePrefs.getBoolean(KEY_OPTED_OUT, false)
+        }
+        set(value) {
+            prefs.edit().putBoolean(KEY_OPTED_OUT, value).apply()
+            statePrefs.edit().putBoolean(KEY_OPTED_OUT, value).apply()
+        }
 
     /**
      * Stable anonymous identifier for this device installation. Generated once on first
@@ -90,6 +197,41 @@ internal class DeviceRegistrar(
         get() = prefs.getString(KEY_ANONYMOUS_ID, null) ?: UUID.randomUUID().toString().also { uuid ->
             prefs.edit().putString(KEY_ANONYMOUS_ID, uuid).apply()
         }
+
+    /**
+     * The anonymous id **without minting one** — `null` until a registration
+     * (or any other read of [anonymousId]) has created it.
+     *
+     * The device-binding header reads this at SDK init, and merely starting the
+     * SDK is not a registration: reading [anonymousId] there would write an
+     * identity for a host app that never registers.
+     */
+    internal val existingAnonymousId: String?
+        get() = prefs.getString(KEY_ANONYMOUS_ID, null)
+
+    /**
+     * [anonymousId], published to [ApiClient] so every later request carries the
+     * device-binding header. This is the read that is allowed to create an
+     * identity: it happens while building a registration payload, i.e. after
+     * the host app asked to register.
+     */
+    private val publishedAnonymousId: String
+        get() = anonymousId.also { apiClient.installationId = it }
+
+    /**
+     * Seeds [anonymousId] with [id] when no id is persisted yet — see
+     * [VisionPush.adoptInstallationId]. No-op, returning the existing id unchanged,
+     * once an id is already stored: an established identity is never overwritten.
+     *
+     * @throws VisionPushError.InvalidArgument if [id] is not a valid UUID string.
+     */
+    internal fun adoptAnonymousId(id: String): String {
+        val normalized = validateInstallationId(id)
+        val existing = prefs.getString(KEY_ANONYMOUS_ID, null)
+        if (existing != null) return existing
+        prefs.edit().putString(KEY_ANONYMOUS_ID, normalized).apply()
+        return normalized
+    }
 
     /**
      * The device's sealed-payload keys, generated + persisted in
@@ -142,6 +284,10 @@ internal class DeviceRegistrar(
             VisionPushError.TokenUnavailable()
         )
 
+        // A pending setExternalId(null) needs its own explicit PUT before the upsert —
+        // omitting external_id from the registration leaves the stored value untouched.
+        flushPendingExternalIdClear()
+
         val registration = buildRegistration(token, initialTags)
         val stateKey = registration.stateKey()
 
@@ -152,14 +298,70 @@ internal class DeviceRegistrar(
         }
 
         VisionPushLogger.i(TAG, "Registering device with VisionPush backend.")
-        return apiClient.registerDevice(registration).onSuccess { id ->
-            lastRegisteredToken = token
-            deviceId = id
-            prefs.edit().putString(KEY_LAST_STATE, stateKey).apply()
-            VisionPushLogger.i(TAG, "Device registered successfully. deviceId=$id")
-        }.onFailure { error ->
-            VisionPushLogger.e(TAG, "Device registration failed: ${error.message}")
+        val previousDeviceId = deviceId
+        val result = apiClient.registerDevice(registration)
+        when (result) {
+            is VisionPushResult.Success -> {
+                val id = result.data
+                lastRegisteredToken = token
+                deviceId = id
+                prefs.edit().putString(KEY_LAST_STATE, stateKey).apply()
+                VisionPushLogger.i(TAG, "Device registered successfully. deviceId=$id")
+                // A NEW device row (first registration, or a re-created identity after
+                // the encrypted store was lost) starts opted-in on the server. Replay a
+                // locally persisted opt-out so the user is not silently re-subscribed.
+                if (isOptedOut && id != previousDeviceId) {
+                    apiClient.optOut(id).onFailure { error ->
+                        VisionPushLogger.w(TAG, "Could not replay opt-out for the new device row: ${error.message}")
+                    }
+                }
+            }
+            is VisionPushResult.Failure -> {
+                VisionPushLogger.e(TAG, "Device registration failed: ${result.error.message}")
+                handleVerificationFailure(result.error)
+            }
         }
+        return result
+    }
+
+    /**
+     * HTTP 403 `external_id_verification_failed`: identity verification is enabled for
+     * the app and the registration set `external_id` without a valid `external_id_hash`.
+     * The rejection is deterministic — [ApiClient] does not retry it — so it is logged at
+     * ERROR with the fix, and the unverified id + hash are dropped locally: otherwise
+     * every later sync (token rotation, WorkManager retry) would carry the same id and be
+     * rejected again, leaving the device permanently unregistrable. Nothing changed
+     * server-side (an omitted `external_id` means "keep the stored value"), so the
+     * server keeps whatever association it already had; the pending-clear flag is left
+     * untouched for the same reason. No-op for any other error.
+     */
+    private fun handleVerificationFailure(error: VisionPushError) {
+        val apiError = error as? VisionPushError.ApiError ?: return
+        if (!apiError.isExternalIdVerificationFailed) return
+        VisionPushLogger.e(TAG, VERIFICATION_FAILED_MESSAGE)
+        prefs.edit().remove(KEY_EXTERNAL_ID).remove(KEY_EXTERNAL_ID_HASH).apply()
+    }
+
+    /**
+     * Pushes a pending `setExternalId(null)` to the backend as an explicit
+     * `clear_external_id` PUT. Kept pending (and retried on the next sync) when the
+     * call fails; dropped when the device was never registered — nothing to clear.
+     */
+    private suspend fun flushPendingExternalIdClear() {
+        if (!isExternalIdClearPending) return
+        val id = deviceId
+        if (id == null) {
+            isExternalIdClearPending = false
+            return
+        }
+        apiClient.clearExternalId(id)
+            .onSuccess {
+                isExternalIdClearPending = false
+                VisionPushLogger.i(TAG, "External ID cleared on backend.")
+            }
+            .onFailure { error ->
+                VisionPushLogger.w(TAG, "Clearing external ID failed – will retry on the next sync: ${error.message}")
+            }
     }
 
     /**
@@ -170,11 +372,13 @@ internal class DeviceRegistrar(
     suspend fun handleTokenRefresh(newToken: String): VisionPushResult<String> {
         VisionPushLogger.i(TAG, "FCM token rotated – triggering re-registration.")
         val registration = buildRegistration(newToken)
-        return apiClient.registerDevice(registration).onSuccess { id ->
-            lastRegisteredToken = newToken
-            deviceId = id
-            prefs.edit().putString(KEY_LAST_STATE, registration.stateKey()).apply()
-        }
+        return apiClient.registerDevice(registration)
+            .onSuccess { id ->
+                lastRegisteredToken = newToken
+                deviceId = id
+                prefs.edit().putString(KEY_LAST_STATE, registration.stateKey()).apply()
+            }
+            .onFailure { error -> handleVerificationFailure(error) }
     }
 
     /**
@@ -283,7 +487,7 @@ internal class DeviceRegistrar(
             pushToken = token,
             platform = config.platform,
             externalId = externalId,
-            installationId = anonymousId,
+            installationId = publishedAnonymousId,
             anonymousId = anonymousId,
             locale = locale,
             country = country,
@@ -303,6 +507,7 @@ internal class DeviceRegistrar(
             sealedPubkey = VisionPushSeal.b64urlEncode(sealed.publicKey),
             sealedKeyAlg = VisionPushSeal.ALG,
             sealedAuth = VisionPushSeal.b64urlEncode(sealed.auth),
+            externalIdHash = externalIdHash,
         )
     }
 
@@ -310,24 +515,46 @@ internal class DeviceRegistrar(
         return try {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
                 ?: return "unknown"
-            val network = cm.activeNetwork ?: return "none"
-            val caps = cm.getNetworkCapabilities(network) ?: return "none"
-            when {
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-                else -> "other"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val network = cm.activeNetwork ?: return "none"
+                val caps = cm.getNetworkCapabilities(network) ?: return "none"
+                when {
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                    else -> "other"
+                }
+            } else {
+                legacyNetworkType(cm)
             }
         } catch (_: SecurityException) {
             "unknown"
         }
     }
 
+    /**
+     * API 21–22 fallback: [ConnectivityManager.getActiveNetwork] only exists from
+     * API 23, and the pre-M signal is the (since API 29 deprecated) NetworkInfo API.
+     */
+    @Suppress("DEPRECATION")
+    private fun legacyNetworkType(cm: ConnectivityManager): String {
+        val info = cm.activeNetworkInfo ?: return "none"
+        if (!info.isConnected) return "none"
+        return when (info.type) {
+            ConnectivityManager.TYPE_WIFI -> "wifi"
+            ConnectivityManager.TYPE_MOBILE -> "cellular"
+            else -> "other"
+        }
+    }
+
     private fun currentNotificationPermission(): String =
         if (NotificationManagerCompat.from(context).areNotificationsEnabled()) "granted" else "denied"
 
-    /** Clears all SDK-persisted state from SharedPreferences. */
+    /** Clears all SDK-persisted state from SharedPreferences (encrypted + plain state). */
     private fun clearLocalState() {
+        // The next request must stop presenting the wiped identity.
+        apiClient.installationId = null
         prefs.edit().clear().apply()
+        statePrefs.edit().clear().apply()
     }
 
     /**
@@ -335,19 +562,103 @@ internal class DeviceRegistrar(
      * state. Used for change-detection to avoid unnecessary API calls.
      */
     private fun DeviceRegistration.stateKey(): String =
-        "${pushToken}|${externalId}|${anonymousId}|${locale}|${country}|${deviceOs}|${environment}|${bundleId}|${appBuildNumber}|${deviceType}|${deviceManufacturer}|${networkType}|${notificationPermission}"
+        "${pushToken}|${externalId}|${externalIdHash}|${anonymousId}|${locale}|${country}|${deviceOs}|${environment}|${bundleId}|${appBuildNumber}|${deviceType}|${deviceManufacturer}|${networkType}|${notificationPermission}"
 
     // ── Companion ───────────────────────────────────────────────────────────
 
     companion object {
         private const val TAG = "VP.DeviceRegistrar"
-        private const val PREFS_FILE_NAME = "visionpush_device"
+        /** Encrypted store (EncryptedSharedPreferences). Exclude from backups — see README. */
+        internal const val PREFS_FILE_NAME = "visionpush_device"
+
+        /** Plain fallback used when the encrypted store cannot be opened. Exclude from backups. */
+        internal const val FALLBACK_PREFS_FILE_NAME = "${PREFS_FILE_NAME}_plain"
+
+        /** Plain, non-secret state (opt-out) that must SURVIVE a lost master key. */
+        internal const val STATE_PREFS_FILE_NAME = "visionpush_device_state"
+
         private const val KEY_LAST_TOKEN = "last_fcm_token"
         private const val KEY_DEVICE_ID = "device_id"
         private const val KEY_EXTERNAL_ID = "external_id"
+        private const val KEY_EXTERNAL_ID_HASH = "external_id_hash"
+        private const val KEY_EXTERNAL_ID_CLEAR_PENDING = "external_id_clear_pending"
+
+        /** ERROR-level log line for the server's `external_id_verification_failed` rejection. */
+        internal const val VERIFICATION_FAILED_MESSAGE =
+            "External ID rejected (HTTP 403 external_id_verification_failed): identity verification " +
+                    "is enabled for this app — pass the hash your backend computed (lowercase hex HMAC-SHA256 " +
+                    "of the external id, keyed with the app's identity secret) via " +
+                    "VisionPush.setExternalId(externalId, externalIdHash). The request is not retried."
         private const val KEY_OPTED_OUT = "opted_out"
         private const val KEY_LAST_STATE = "last_reg_state"
         private const val KEY_ANONYMOUS_ID = "anonymous_id"
         private const val KEY_SEALED_KEYS = "sealed_keys"
+
+        /**
+         * Opens the same encrypted device-state store the instance [prefs] property uses,
+         * falling back to plain SharedPreferences when the Android Keystore master key
+         * cannot be provisioned/opened. [onFallback] lets each caller react (set
+         * [usingFallbackStorage], log) without duplicating the open/catch logic — shared by
+         * the instance [prefs] lazy and the pre-initialize seed path [seedAnonymousId].
+         */
+        private fun openEncryptedPrefs(
+            context: Context,
+            onFallback: (Exception) -> Unit
+        ): SharedPreferences = try {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            EncryptedSharedPreferences.create(
+                context,
+                PREFS_FILE_NAME,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+        } catch (e: Exception) {
+            onFallback(e)
+            context.getSharedPreferences(FALLBACK_PREFS_FILE_NAME, Context.MODE_PRIVATE)
+        }
+
+        /**
+         * Validates [id] is a UUID string, throwing [VisionPushError.InvalidArgument] (named
+         * after the offending value) otherwise. Shared by the instance [adoptAnonymousId]
+         * and the static pre-initialize [seedAnonymousId] so both reject the same way.
+         */
+        internal fun validateInstallationId(id: String): String =
+            try {
+                UUID.fromString(id).toString()
+            } catch (e: IllegalArgumentException) {
+                throw VisionPushError.InvalidArgument(
+                    "adoptInstallationId: '$id' is not a valid UUID."
+                )
+            }
+
+        /**
+         * Seeds the installation id BEFORE a [DeviceRegistrar] instance exists — the path
+         * [VisionPush.adoptInstallationId] takes when called ahead of [VisionPush.initialize],
+         * e.g. a Unity player migrating from the REST bridge to this native core. Opens the
+         * same store [prefs] would, so a [DeviceRegistrar] created afterwards picks up the
+         * seeded id as its [anonymousId] / [existingAnonymousId] instead of minting a new one.
+         *
+         * No-op, returning the existing id unchanged, once an id is already stored.
+         *
+         * @throws VisionPushError.InvalidArgument if [id] is not a valid UUID string.
+         */
+        internal fun seedAnonymousId(context: Context, id: String): String {
+            val normalized = validateInstallationId(id)
+            val store = openEncryptedPrefs(context) { e ->
+                VisionPushLogger.e(
+                    TAG,
+                    "EncryptedSharedPreferences unavailable – seeding installation id into " +
+                            "plain fallback storage. Cause: ${e.message}",
+                    e
+                )
+            }
+            val existing = store.getString(KEY_ANONYMOUS_ID, null)
+            if (existing != null) return existing
+            store.edit().putString(KEY_ANONYMOUS_ID, normalized).apply()
+            return normalized
+        }
     }
 }

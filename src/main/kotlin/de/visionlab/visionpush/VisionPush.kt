@@ -7,8 +7,10 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.result.ActivityResultLauncher
 import androidx.annotation.MainThread
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -50,6 +52,8 @@ import java.util.Collections
  *
  * ```kotlin
  * VisionPush.setExternalId("user_123")
+ * // With identity verification enabled for the app: pass the HMAC your backend computed
+ * VisionPush.setExternalId("user_123", externalIdHash = hashFromYourBackend)
  * ```
  *
  * ## Custom notification handling
@@ -92,6 +96,12 @@ object VisionPush {
     @Volatile internal var internalIamController: InAppMessageController? = null
 
     /**
+     * On-device geofencing manager — created lazily by [enableGeofencing] and torn
+     * down by [disableGeofencing] / [logout]. Null until geofencing is enabled.
+     */
+    @Volatile internal var internalGeofenceManager: GeofenceManager? = null
+
+    /**
      * Owned-transport realtime channel — created lazily by [enableRealtime] and
      * torn down by [disableRealtime] / [logout].
      */
@@ -99,6 +109,21 @@ object VisionPush {
 
     /** Optional observer for realtime connection-state changes (set via [setRealtimeStatusHandler]). */
     @Volatile private var realtimeStatusHandler: ((RealtimeConnectionState) -> Unit)? = null
+
+    /**
+     * `true` when [enableRealtime] was called before device registration completed and
+     * the connect is deferred until [notifyDeviceRegistered] runs.
+     */
+    @Volatile private var realtimeDeferred = false
+
+    /** The explicit installation id passed to the deferred [enableRealtime] call ("" = SDK default). */
+    @Volatile private var realtimeDeferredInstallationId: String = ""
+
+    /** Test seam: transport used by [enableRealtime] instead of the OkHttp factory. */
+    @Volatile internal var realtimeTransportFactory: RealtimeChannel.WebSocketFactory? = null
+
+    /** Test seam: reconnect scheduler used by [enableRealtime] instead of the Handler one. */
+    @Volatile internal var realtimeReconnectScheduler: RealtimeChannel.ReconnectScheduler? = null
 
     /** Retained application context — set during [initialize], never null after that. */
     @Volatile private var applicationContext: Context? = null
@@ -125,8 +150,26 @@ object VisionPush {
      */
     @Volatile private var onRegistrationFailedCallback: ((error: Exception) -> Unit)? = null
 
+    /**
+     * Last line of defence for SDK background work: an uncaught throwable in a
+     * coroutine launched on [sdkScope] (an `OutOfMemoryError` decoding a hostile
+     * image, an `IllegalStateException` from an un-initialized WorkManager, …) is
+     * logged and reported to [onError] — it must NEVER propagate to the host app's
+     * uncaught-exception handler and crash the process. `SupervisorJob` already keeps
+     * sibling coroutines alive; this handler keeps the app alive.
+     */
+    private val sdkExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        VisionPushLogger.e(TAG, "Unhandled error in SDK background task: ${throwable.message}", throwable)
+        val handler = errorHandler ?: return@CoroutineExceptionHandler
+        try {
+            handler(throwable as? VisionPushError ?: VisionPushError.Unknown(throwable))
+        } catch (_: Exception) {
+            // A throwing host callback must not recurse into a crash either.
+        }
+    }
+
     /** SDK-wide coroutine scope; survives the entire application lifetime. */
-    private val sdkScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val sdkScope = CoroutineScope(SupervisorJob() + Dispatchers.Main + sdkExceptionHandler)
 
     /**
      * In-memory LRU-like cache of recently received notifications keyed by ID.
@@ -273,33 +316,42 @@ object VisionPush {
     @JvmOverloads
     fun initializeWithConfig(context: Context, config: VisionPushConfig, initialTags: Map<String, String> = emptyMap()) {
         val appContext = context.applicationContext
-        applicationContext = appContext
-        loadHistory()
-
-        VisionPushLogger.minLevel = config.logLevel
-        VisionPushLogger.i(TAG, "Initializing VisionPush SDK v$SDK_VERSION appId=${config.appId}")
-
-        if (!config.apiKey.startsWith("vp_live_") && !config.apiKey.startsWith("vp_test_")) {
-            VisionPushLogger.w(
-                TAG,
-                "API key does not start with 'vp_live_' or 'vp_test_'. " +
-                        "Ensure you are using a valid VisionPush API key."
-            )
-        }
 
         val apiClient: ApiClient
         val registrar: DeviceRegistrar
-        val notificationBuilder: NotificationBuilder
 
         synchronized(VisionPush) {
-            // Guard against concurrent initialize() calls from multiple threads.
+            // Guard against concurrent / repeated initialize() calls FIRST, before any
+            // side effects run. Otherwise loadHistory(), the IAM controller registration,
+            // and channel creation would all execute twice on a duplicate call.
             if (initialized) {
                 VisionPushLogger.d(TAG, "Already initialized – skipping duplicate call.")
                 return
             }
+
+            applicationContext = appContext
+            loadHistory()
+
+            VisionPushLogger.minLevel = config.logLevel
+            VisionPushLogger.i(TAG, "Initializing VisionPush SDK v$SDK_VERSION appId=${config.appId}")
+
+            if (!config.apiKey.startsWith("vp_live_") && !config.apiKey.startsWith("vp_test_")) {
+                VisionPushLogger.w(
+                    TAG,
+                    "API key does not start with 'vp_live_' or 'vp_test_'. " +
+                            "Ensure you are using a valid VisionPush API key."
+                )
+            }
+
             apiClient = ApiClient(config)
             registrar = DeviceRegistrar(appContext, config, apiClient)
-            notificationBuilder = NotificationBuilder(appContext)
+            // Device binding: from here on every request carries this
+            // installation's id, so the (extractable) client key alone can no
+            // longer act on another user's device. Seeded WITHOUT minting one —
+            // initialize() is not a registration; the registrar publishes the
+            // id the moment it mints one.
+            apiClient.installationId = registrar.existingAnonymousId
+            val notificationBuilder = NotificationBuilder(appContext)
 
             internalApiClient = apiClient
             internalDeviceRegistrar = registrar
@@ -337,6 +389,10 @@ object VisionPush {
             }
         }
 
+        // Wire IAM OUTCOME button taps so an in-app message's "outcome" action records
+        // a conversion via the same backend path as the public sendOutcome() API.
+        internalIamController?.onOutcome = { name -> dispatchOutcome(name) }
+
         // Initial device registration – failures schedule a WorkManager retry
         sdkScope.launch {
             when (val regResult = registrar.register(initialTags = initialTags)) {
@@ -349,6 +405,9 @@ object VisionPush {
                             internalApiClient?.trackIAMImpression(config.appId, deviceId, messageId)
                         }
                     }
+                    // Wire up whatever was enabled before registration completed: geofence
+                    // attribution and a deferred realtime connect.
+                    notifyDeviceRegistered(deviceId)
                     // Fetch and trigger in-app messages for this session.
                     val iamResult = internalApiClient?.fetchInAppMessages(config.appId, deviceId)
                     if (iamResult is VisionPushResult.Success) {
@@ -478,23 +537,97 @@ object VisionPush {
      * Setting the same value again is idempotent. Pass `null` to clear the
      * association (e.g. after logout; also consider calling [logout]).
      *
-     * @param externalId Opaque string, or `null` to clear.
+     * Clearing is an explicit backend operation: the device upsert treats an omitted
+     * `external_id` as "unchanged", so `null` sends `PUT /devices/{id}
+     * {"clear_external_id": true}` before re-registering. If that call fails (offline)
+     * the clear stays pending locally and is retried on the next registration sync —
+     * the device never silently keeps the previous user's id.
+     *
+     * ## Identity verification
+     *
+     * When identity verification is enabled for the app (VisionPush dashboard), the
+     * server only accepts an external id that comes with an [externalIdHash] proving
+     * your backend vouches for it — otherwise any user of the app could claim another
+     * user's id with the client API key and receive that user's pushes. The hash is the
+     * lowercase hex HMAC-SHA256 of the external id, keyed with the app's identity secret.
+     * **Your backend computes it; the secret must never ship inside the app** — the SDK
+     * only forwards the hash. It is stored next to the id and re-sent with it on every
+     * registration (e.g. after an FCM token rotation), and wiped by [logout].
+     *
+     * A missing or wrong hash is rejected with HTTP 403 `external_id_verification_failed`
+     * ([VisionPushError.ApiError.isExternalIdVerificationFailed]): the SDK logs it at
+     * ERROR level, does not retry, restores the previously accepted identity locally, and
+     * reports the failure through [callback] and [onError]. With verification disabled
+     * the hash is ignored, so it is always safe to pass one.
+     *
+     * @param externalId     Opaque string, or `null` to clear.
+     * @param externalIdHash The backend-computed identity-verification hash for
+     *                       [externalId] (64 hex characters; upper-case input is
+     *                       normalised). Ignored when [externalId] is `null`.
+     * @param callback       Optional result callback invoked on the main thread once the
+     *                       identity has been pushed to the backend.
+     * @throws VisionPushError.InvalidArgument for an id over 1 024 characters or a hash
+     *         that is not 64 hex characters.
      */
     @JvmStatic
-    fun setExternalId(externalId: String?) {
+    @JvmOverloads
+    fun setExternalId(
+        externalId: String?,
+        externalIdHash: String? = null,
+        callback: ((VisionPushResult<Unit>) -> Unit)? = null
+    ) {
         if (externalId != null && externalId.length > 1_024) {
             throw VisionPushError.InvalidArgument("externalId must be 1 024 characters or fewer.")
         }
+        // A hash without an id is meaningless (clearing never needs one) — don't even validate it.
+        val hash = if (externalId == null) null else normalizeExternalIdHash(externalIdHash)
         checkInitialized()
         checkConsent()
         val registrar = internalDeviceRegistrar ?: return
-        if (registrar.externalId == externalId) return
+        if (registrar.externalId == externalId && registrar.externalIdHash == hash) {
+            callback?.invoke(VisionPushResult.Success(Unit))
+            return
+        }
 
-        registrar.externalId = externalId
-        VisionPushLogger.i(TAG, "External ID updated: $externalId")
+        VisionPushLogger.i(
+            TAG,
+            when {
+                externalId == null -> "External ID cleared."
+                hash != null -> "External ID updated: $externalId (with identity hash)"
+                else -> "External ID updated: $externalId"
+            }
+        )
 
-        sdkScope.launch { registrar.register(forceRefresh = true) }
+        // updateExternalIdentity() persists id + hash, then register() flushes a pending
+        // clear (explicit PUT) before the upsert that carries them.
+        sdkScope.launch {
+            val result = registrar.updateExternalIdentity(externalId, hash).map { }
+            withContext(Dispatchers.Main) {
+                result.onFailure { error -> errorHandler?.invoke(error) }
+                callback?.invoke(result)
+            }
+        }
     }
+
+    /**
+     * Normalises a caller-supplied identity-verification hash: trims, lowercases (the
+     * server compares lowercase hex) and rejects anything that is not exactly the 64 hex
+     * characters of an HMAC-SHA256 — catching a raw secret, base64 or a truncated value
+     * locally instead of with a 403 round-trip. Blank → `null`.
+     */
+    @VisibleForTesting
+    internal fun normalizeExternalIdHash(raw: String?): String? {
+        val hash = raw?.trim()?.lowercase() ?: return null
+        if (hash.isEmpty()) return null
+        if (!EXTERNAL_ID_HASH_PATTERN.matches(hash)) {
+            throw VisionPushError.InvalidArgument(
+                "externalIdHash must be the 64-character lowercase hex HMAC-SHA256 of the external id, computed by your backend."
+            )
+        }
+        return hash
+    }
+
+    private val EXTERNAL_ID_HASH_PATTERN = Regex("[0-9a-f]{64}")
 
     /** The currently configured external user identifier, or `null` before it is set. */
     @get:JvmStatic
@@ -825,6 +958,39 @@ object VisionPush {
     // ── Device registration ─────────────────────────────────────────────────
 
     /**
+     * Seeds this installation's identity so a device migrating from another VisionPush
+     * bridge — e.g. a Unity player switching from the REST bridge to this native core —
+     * keeps its existing device record instead of registering as a brand-new device.
+     *
+     * Call this **before** [initialize] whenever possible, so the very first registration
+     * already carries [id] (Unity passes its `vp_installation_id` PlayerPrefs value). It is
+     * also safe to call after [initialize].
+     *
+     * No-op once an installation id is already persisted: [id] is discarded and the
+     * pre-existing id is returned unchanged. An established identity is never overwritten.
+     *
+     * ```java
+     * // Java — the Unity bridge is Java-callable through this @JvmStatic method.
+     * String installationId = VisionPush.adoptInstallationId(context, unityStoredId);
+     * ```
+     *
+     * @param context Any context; only used to open the local identity store.
+     * @param id The UUID installation id to adopt.
+     * @return The installation id now in effect: [id] if it was adopted, or the
+     *         pre-existing id if one was already stored.
+     * @throws VisionPushError.InvalidArgument if [id] is not a valid UUID string.
+     */
+    @JvmStatic
+    fun adoptInstallationId(context: Context, id: String): String {
+        val registrar = internalDeviceRegistrar
+        return if (registrar != null) {
+            registrar.adoptAnonymousId(id)
+        } else {
+            DeviceRegistrar.seedAnonymousId(context.applicationContext, id)
+        }
+    }
+
+    /**
      * Forces an immediate device registration sync with the backend.
      *
      * Useful after restoring a backup or when the host app detects a state
@@ -841,6 +1007,7 @@ object VisionPush {
         sdkScope.launch {
             val result = internalDeviceRegistrar?.register(forceRefresh = true)
                 ?: VisionPushResult.Failure(VisionPushError.NotInitialized())
+            result.onSuccess { id -> notifyDeviceRegistered(id) }
             withContext(Dispatchers.Main) { callback?.invoke(result) }
         }
     }
@@ -849,8 +1016,10 @@ object VisionPush {
      * Removes all device registration data from the VisionPush backend and
      * clears all locally stored state. Call during user logout.
      *
-     * After calling [logout], call [initialize] or [syncDevice] to resume
-     * push delivery for a new user.
+     * After calling [logout] the SDK returns to the un-initialized state, so a
+     * subsequent [initialize] re-registers cleanly (e.g. when a different user
+     * logs in). Calling [initialize] again is required to resume push delivery;
+     * unlike before this fix, it is no longer a silent no-op.
      *
      * @param callback Optional result callback invoked on the main thread.
      */
@@ -858,16 +1027,34 @@ object VisionPush {
     @JvmOverloads
     fun logout(callback: ((VisionPushResult<Unit>) -> Unit)? = null) {
         checkInitialized()
-        // Tear down the realtime socket so a logged-out device stops receiving pushes.
+        // Tear down the realtime socket + geofencing so a logged-out device stops
+        // receiving pushes and reporting location (disableRealtime also drops a
+        // deferred connect).
         disableRealtime()
+        disableGeofencing()
+        // Capture the registrar before we reset component refs below; unregister()
+        // needs it, but a logout→login-as-different-user flow must re-initialize.
+        val registrar = internalDeviceRegistrar
         sdkScope.launch {
-            internalNotificationHandler = null
-            internalNotificationOpenCallback = null
-            val result = internalDeviceRegistrar?.unregister()
+            val result = registrar?.unregister()
                 ?: VisionPushResult.Failure(VisionPushError.NotInitialized())
-            cachedTags = emptyMap()
-            cachedTopics = emptySet()
-            VisionPushLogger.i(TAG, "User logged out; device unregistered.")
+
+            // Reset SDK to the un-initialized state so initialize() can run again for
+            // a new user. Guarded with the same lock initialize() uses.
+            synchronized(VisionPush) {
+                internalNotificationHandler = null
+                internalNotificationOpenCallback = null
+                internalApiClient = null
+                internalDeviceRegistrar = null
+                internalNotificationBuilder = null
+                internalIamController = null
+                internalGeofenceManager = null
+                activeConfig = null
+                cachedTags = emptyMap()
+                cachedTopics = emptySet()
+                initialized = false
+            }
+            VisionPushLogger.i(TAG, "User logged out; device unregistered. SDK reset – call initialize() to re-register.")
             withContext(Dispatchers.Main) { callback?.invoke(result) }
         }
     }
@@ -896,8 +1083,14 @@ object VisionPush {
      * Only has an effect when [VisionPushConfig.consentRequired] is `true`.
      * When [given] is `true` and the SDK is in the consent-pending state, this
      * method triggers full device registration with the VisionPush backend.
-     * When [given] is `false`, the consent flag is cleared so future backend
-     * calls will fail with [VisionPushError.ConsentRequired].
+     *
+     * When [given] is `false` the consent flag is cleared so future backend calls
+     * fail with [VisionPushError.ConsentRequired], AND every automatic data flow is
+     * torn down: the realtime channel is disconnected ([disableRealtime]), geofencing
+     * stops reporting location ([disableGeofencing]), tracking events still queued in
+     * WorkManager are cancelled, and the automatic DELIVERED / OPENED / DISMISSED
+     * events of subsequently received notifications are dropped. Notifications are
+     * still *displayed* — display is not data collection.
      *
      * @param given `true` to grant consent, `false` to revoke it.
      */
@@ -907,12 +1100,21 @@ object VisionPush {
         persistConsent(ctx, given)
         VisionPushLogger.i(TAG, "Privacy consent ${if (given) "granted" else "revoked"}.")
 
-        if (!given) return
+        if (!given) {
+            // Revocation must stop every automatic data flow, not just flip a flag.
+            disableRealtime()
+            disableGeofencing()
+            NotificationTracker.cancelPendingWork(ctx)
+            return
+        }
 
         // Trigger backend registration now that consent has been granted.
         sdkScope.launch {
             internalDeviceRegistrar?.register(forceRefresh = true)
-                ?.onSuccess { id -> VisionPushLogger.i(TAG, "Device registered after consent. deviceId=$id") }
+                ?.onSuccess { id ->
+                    VisionPushLogger.i(TAG, "Device registered after consent. deviceId=$id")
+                    notifyDeviceRegistered(id)
+                }
                 ?.onFailure { error ->
                     VisionPushLogger.w(TAG, "Post-consent registration failed: ${error.message}")
                     applicationContext?.let { scheduleRegistrationSync(it) }
@@ -1289,8 +1491,14 @@ object VisionPush {
      * failures. Online delivery is best-effort / at-most-once (Phase 1).
      *
      * Calling this again while already enabled re-resolves the device identity and
-     * reconnects. No-op until the device has registered (an installation ID is
-     * required); use [setOnRegisteredListener] to know when registration completes.
+     * reconnects. Called before device registration has completed (registration is
+     * asynchronous — [initialize] returns first), the connect is **deferred** and
+     * performed automatically once the device is registered; connecting earlier would
+     * only make the gateway reject an unknown device.
+     *
+     * If the gateway rejects the device (close code `4401` auth rejected / `4404`
+     * device unknown or inactive) the channel stops reconnecting and logs a warning
+     * once — fix the cause (API key, re-registration) and call this again.
      *
      * @param installationId Optional explicit device identifier. When omitted the
      *   SDK's own installation ID (the same one used for device registration) is used.
@@ -1301,9 +1509,24 @@ object VisionPush {
         checkInitialized()
         checkConsent()
         val config = activeConfig ?: throw VisionPushError.NotInitialized()
-        val resolvedId = installationId?.takeIf { it.isNotBlank() }
-            ?: internalDeviceRegistrar?.anonymousId
-        if (resolvedId.isNullOrBlank()) {
+        val registrar = internalDeviceRegistrar ?: throw VisionPushError.NotInitialized()
+
+        if (registrar.deviceId == null) {
+            // `initialized` flips before the async registration completes. Connecting now
+            // would be rejected with 4404 (device unknown) — defer until the registration
+            // success path calls notifyDeviceRegistered().
+            realtimeDeferredInstallationId = installationId?.takeIf { it.isNotBlank() } ?: ""
+            realtimeDeferred = true
+            VisionPushLogger.i(
+                TAG,
+                "enableRealtime() called before device registration completed – deferring the connect until the device is registered."
+            )
+            return
+        }
+        realtimeDeferred = false
+
+        val resolvedId = installationId?.takeIf { it.isNotBlank() } ?: registrar.anonymousId
+        if (resolvedId.isBlank()) {
             VisionPushLogger.w(TAG, "enableRealtime() called before an installation ID is available – ignoring.")
             return
         }
@@ -1319,7 +1542,9 @@ object VisionPush {
             onPush = { payload, _ -> handleRealtimePush(payload) },
             onStatusChange = { state ->
                 sdkScope.launch { realtimeStatusHandler?.invoke(state) }
-            }
+            },
+            factory = realtimeTransportFactory ?: OkHttpWebSocketFactory(),
+            scheduler = realtimeReconnectScheduler ?: HandlerReconnectScheduler(),
         )
         internalRealtimeChannel = channel
         channel.connect()
@@ -1327,11 +1552,13 @@ object VisionPush {
     }
 
     /**
-     * Closes the realtime channel and stops reconnect attempts. Pushes resume
-     * being delivered over FCM. Safe to call when realtime is disabled (no-op).
+     * Closes the realtime channel and stops reconnect attempts (and cancels a connect
+     * that [enableRealtime] deferred). Pushes resume being delivered over FCM. Safe
+     * to call when realtime is disabled (no-op).
      */
     @JvmStatic
     fun disableRealtime() {
+        realtimeDeferred = false
         internalRealtimeChannel?.disconnect()
         internalRealtimeChannel = null
         VisionPushLogger.i(TAG, "Realtime channel disabled.")
@@ -1356,6 +1583,67 @@ object VisionPush {
         realtimeStatusHandler = handler
     }
 
+    // ── Geofencing (location-triggered campaigns) ────────────────────────────
+
+    /**
+     * Enables on-device geofencing.
+     *
+     * Once enabled the SDK periodically reports the device's coarse location to the
+     * VisionPush backend (`PUT /devices/{id}/location`), receives the nearest active
+     * geofences, and registers them with the OS. Geofence entry/exit/dwell transitions
+     * are reported back to the backend ([GeofenceManager] → [GeofenceTransitionReceiver]
+     * → [GeofenceEventWorker]) so location-triggered campaigns can fire.
+     *
+     * **The host app must request the location runtime permissions itself** before (or
+     * after) calling this — `ACCESS_FINE_LOCATION` and, for background geofencing on
+     * Android 10+ (API 29), `ACCESS_BACKGROUND_LOCATION`. The SDK never prompts for
+     * location; without the permission the manager simply stays idle until it is granted
+     * and [enableGeofencing] is called again. The permissions are declared in the SDK
+     * manifest but left for the host to request at the right moment in its UX.
+     *
+     * No-op when called repeatedly while already enabled (the existing manager is reused).
+     * Mirrors the iOS SDK's geofencing entry point.
+     */
+    @JvmStatic
+    @MainThread
+    fun enableGeofencing() {
+        checkInitialized()
+        checkConsent()
+        if (internalGeofenceManager != null) {
+            VisionPushLogger.d(TAG, "Geofencing already enabled – ignoring duplicate call.")
+            return
+        }
+        val ctx = applicationContext ?: throw VisionPushError.NotInitialized()
+        val client = internalApiClient ?: throw VisionPushError.NotInitialized()
+
+        val manager = GeofenceManager(ctx, client)
+        // If the device is already registered, attribute location syncs immediately;
+        // otherwise the registration-success path wires the deviceId once it arrives.
+        internalDeviceRegistrar?.deviceId?.let { manager.setDeviceId(it) }
+        internalGeofenceManager = manager
+        manager.start()
+        VisionPushLogger.i(TAG, "Geofencing enabled.")
+    }
+
+    /**
+     * Disables on-device geofencing: stops location updates and removes all SDK-registered
+     * geofences from the OS. Safe to call when geofencing is disabled (no-op).
+     */
+    @JvmStatic
+    @MainThread
+    fun disableGeofencing() {
+        internalGeofenceManager?.let { manager ->
+            manager.stop()
+            internalGeofenceManager = null
+            VisionPushLogger.i(TAG, "Geofencing disabled.")
+        }
+    }
+
+    /** `true` when on-device geofencing is currently enabled. */
+    @get:JvmStatic
+    val isGeofencingEnabled: Boolean
+        get() = internalGeofenceManager != null
+
     /**
      * Forwards a realtime push payload into the same notification pipeline used
      * for FCM messages, so consumers see a single delivery API.
@@ -1367,14 +1655,7 @@ object VisionPush {
             VisionPushLogger.w(TAG, "Dropping malformed realtime push payload: ${e.message}")
             return
         }
-        storeNotification(notification)
-        recordNotificationReceived(notification)
-        sdkScope.launch {
-            internalNotificationHandler?.invoke(notification)
-            if (notification.showSystemNotification && foregroundNotificationEnabled) {
-                internalNotificationBuilder?.show(notification)
-            }
-        }
+        sdkScope.launch { deliverNotification(notification) }
     }
 
     // ── Inbound push pipeline (shared by the FCM + HMS messaging services) ────
@@ -1384,9 +1665,10 @@ object VisionPush {
      * [VisionPushMessagingService] (FCM) or `VisionPushHmsMessagingService` (HMS).
      *
      * Unseals a sealed payload (Mode A/B) with [sealedKeys], parses the VisionPush
-     * envelope (`vp_payload`), caches it for open-tracking and dispatches it to the
-     * custom handler and/or a system notification. This is the single source of
-     * truth for the FCM and HMS receive paths — both produce identical behaviour.
+     * envelope (`vp_payload`), and routes it through [deliverNotification] — the single
+     * delivery path shared with the realtime channel — so caching, history, the custom
+     * handler, the system UI, and the DELIVERED event behave identically across all
+     * delivery sources (FCM, HMS, realtime).
      *
      * @param data       Raw provider data map (FCM `RemoteMessage.data` /
      *                   HMS `RemoteMessage.dataOfMap`).
@@ -1402,26 +1684,46 @@ object VisionPush {
             return
         }
         VisionPushLogger.i(TAG, "VisionPush notification received: id=${notification.id}")
-        storeNotification(notification)
-        sdkScope.launch { dispatchInboundNotification(notification) }
+        sdkScope.launch { deliverNotification(notification) }
     }
 
-    /** Dispatches a parsed notification to the custom handler and/or the system UI. */
-    private suspend fun dispatchInboundNotification(notification: VisionPushNotification) {
+    /**
+     * Unified inbound-delivery path for every source (FCM, HMS, realtime).
+     *
+     * Performs, in order and exactly once per notification:
+     * 1. caches the model for open-tracking ([storeNotification]),
+     * 2. appends it to the local notification history ([recordNotificationReceived]),
+     * 3. invokes the custom [setNotificationHandler] callback,
+     * 4. either posts the system notification (which records the DELIVERED event), or —
+     *    when the system UI is suppressed — records a standalone DELIVERED event.
+     *
+     * Both the history append and the DELIVERED event are de-duplicated by VP notification
+     * ID (history in [recordNotificationReceived], DELIVERED in
+     * [NotificationBuilder.trackDeliveredOnce]) so duplicate provider deliveries of the same
+     * message do not double-count.
+     */
+    private suspend fun deliverNotification(notification: VisionPushNotification) {
+        storeNotification(notification)
+        recordNotificationReceived(notification)
+
         internalNotificationHandler?.let { handler ->
             VisionPushLogger.d(TAG, "Delegating notification to custom handler.")
             handler(notification)
         }
-        if (notification.showSystemNotification && foregroundNotificationEnabled) {
-            val builder = internalNotificationBuilder
-            if (builder != null) {
-                builder.show(notification)
-            } else {
+
+        val builder = internalNotificationBuilder
+        when {
+            builder == null ->
+                // SDK not initialized – no builder means we can neither show UI nor track.
                 VisionPushLogger.w(
                     TAG,
-                    "SDK not initialized – cannot display system notification id=${notification.id}"
+                    "SDK not initialized – cannot display or track notification id=${notification.id}"
                 )
-            }
+            notification.showSystemNotification && foregroundNotificationEnabled ->
+                builder.show(notification) // records DELIVERED (deduped) after posting
+            else ->
+                // No system UI shown – still record the DELIVERED event once for this ID.
+                builder.trackDeliveredOnce(notification)
         }
     }
 
@@ -1454,6 +1756,44 @@ object VisionPush {
                     VisionPushLogger.e(TAG, "Token refresh registration failed: ${error.message}")
                     scheduleRegistrationSync(appContext)
                 }
+        }
+    }
+
+    // ── Logging (cross-module shim) ──────────────────────────────────────────
+
+    /**
+     * Routes a log line through the SDK's level-gated [VisionPushLogger].
+     *
+     * The logger itself is `internal`, so a companion Gradle module — notably the
+     * Huawei transport (`VisionPushHms`) — cannot reach it directly and would
+     * otherwise have to call `android.util.Log` unconditionally, bypassing the
+     * verbosity the host app configured via [VisionPushConfig.logLevel]. This
+     * `public` shim lets such modules honour that level with a single call.
+     *
+     * The line is emitted only when [level] passes the configured minimum, exactly
+     * as for the core SDK's own logging.
+     *
+     * @param level     Severity of this line.
+     * @param tag       Log tag (e.g. `"VP.Hms"`).
+     * @param message   Human-readable message.
+     * @param throwable Optional cause, attached for [VisionPushConfig.LogLevel.WARN]
+     *                  and [VisionPushConfig.LogLevel.ERROR] so stack traces survive.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun logInternal(
+        level: VisionPushConfig.LogLevel,
+        tag: String,
+        message: String,
+        throwable: Throwable? = null
+    ) {
+        when (level) {
+            VisionPushConfig.LogLevel.NONE -> Unit
+            VisionPushConfig.LogLevel.VERBOSE -> VisionPushLogger.v(tag, message)
+            VisionPushConfig.LogLevel.DEBUG -> VisionPushLogger.d(tag, message)
+            VisionPushConfig.LogLevel.INFO -> VisionPushLogger.i(tag, message)
+            VisionPushConfig.LogLevel.WARN -> VisionPushLogger.w(tag, message, throwable)
+            VisionPushConfig.LogLevel.ERROR -> VisionPushLogger.e(tag, message, throwable)
         }
     }
 
@@ -1562,11 +1902,79 @@ object VisionPush {
         notificationCache[notificationId]
 
     /**
+     * Fire-and-forget outcome dispatch shared by the public [sendOutcome] API and the
+     * in-app-message OUTCOME button wiring ([InAppMessageController.onOutcome]). Records
+     * a named conversion via the same backend endpoint; failures are logged, not surfaced.
+     */
+    private fun dispatchOutcome(name: String) {
+        sdkScope.launch {
+            val deviceId = internalDeviceRegistrar?.deviceId
+            if (deviceId == null) {
+                VisionPushLogger.w(TAG, "Outcome '$name' dropped – device not yet registered.")
+                return@launch
+            }
+            internalApiClient?.sendOutcome(deviceId, name)
+                ?.onFailure { error -> VisionPushLogger.w(TAG, "Outcome '$name' failed: ${error.message}") }
+        }
+    }
+
+    /**
      * Schedules a background device registration sync via WorkManager.
      * Called when an immediate registration attempt fails due to no network.
      */
     internal fun scheduleRegistrationSync(context: Context) {
         RegistrationSyncWorker.enqueue(context)
+    }
+
+    /**
+     * Post-registration hook: attributes geofence syncs to the new device id and
+     * performs a realtime connect that [enableRealtime] deferred because no device
+     * existed yet. Idempotent; safe to call on every successful registration.
+     */
+    internal fun notifyDeviceRegistered(deviceId: String) {
+        internalGeofenceManager?.setDeviceId(deviceId)
+        if (!realtimeDeferred) return
+        realtimeDeferred = false
+        val explicitId = realtimeDeferredInstallationId.takeIf { it.isNotBlank() }
+        try {
+            enableRealtime(explicitId)
+        } catch (e: VisionPushError) {
+            VisionPushLogger.w(TAG, "Deferred realtime enable failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Test-only: returns the singleton to its pristine, un-initialized state without
+     * any network I/O (unlike [logout]). Robolectric test classes share one sandbox
+     * class loader, so a test that initializes the SDK must reset it in `@After`.
+     */
+    @VisibleForTesting
+    internal fun resetForTesting() {
+        synchronized(VisionPush) {
+            internalRealtimeChannel?.disconnect()
+            internalRealtimeChannel = null
+            internalGeofenceManager = null
+            internalApiClient = null
+            internalDeviceRegistrar = null
+            internalNotificationBuilder = null
+            internalIamController = null
+            internalNotificationHandler = null
+            internalNotificationOpenCallback = null
+            realtimeStatusHandler = null
+            errorHandler = null
+            onRegisteredCallback = null
+            onRegistrationFailedCallback = null
+            activeConfig = null
+            cachedTags = emptyMap()
+            cachedTopics = emptySet()
+            realtimeDeferred = false
+            realtimeDeferredInstallationId = ""
+            realtimeTransportFactory = null
+            realtimeReconnectScheduler = null
+            pushTokenProvider = null
+            applicationContext = null
+            initialized = false
+        }
     }
 
     // ── Precondition guards ──────────────────────────────────────────────────

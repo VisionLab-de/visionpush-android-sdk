@@ -260,19 +260,128 @@ class RealtimeChannelTest {
     }
 
     @Test
-    fun authOkResetsBackoffSoSecondFailureUsesBaseDelay() {
+    fun authOkResetsBackoffSoTheNextFailureUsesTheBaseDelay() {
+        // The old version of this test asserted the base delay right after the FIRST
+        // failure — with zero prior attempts the counter was already 0, so it passed
+        // whether or not auth_ok reset anything. Grow the back-off first, then prove
+        // auth_ok drops it back to the base.
         val factory = FakeFactory()
         val scheduler = ManualScheduler()
         val ch = channel(factory, scheduler)
         ch.connect()
-        var listener = factory.listeners[0]
-        listener.onOpen(factory.sockets[0], dummyResponse())
-        listener.onMessage(factory.sockets[0], """{"type":"auth_ok"}""") // reset attempts
 
-        // First unexpected close after a good auth → base-ish delay (attempt 0).
-        listener.onClosed(factory.sockets[0], 1006, "x")
-        // attempt 0: capped = 1000ms, jitter ±50% → within [500, 1500].
-        assertTrue("delay=${scheduler.lastDelay}", scheduler.lastDelay in 500..1500)
+        // Four consecutive failures: attempts 0..3 → equal-jitter delays
+        // [500,1000], [1000,2000], [2000,4000], [4000,8000].
+        repeat(4) { i ->
+            val socket = factory.sockets[i]
+            factory.listeners[i].onOpen(socket, dummyResponse())
+            factory.listeners[i].onClosed(socket, 1006, "x")
+            assertTrue("attempt $i delay=${scheduler.lastDelay}", scheduler.pending != null)
+            scheduler.fire()
+        }
+        assertTrue("back-off must have grown, delay=${scheduler.lastDelay}", scheduler.lastDelay >= 4_000)
+        assertEquals(5, factory.sockets.size)
+
+        // Successful handshake on the 5th socket resets the counter…
+        val socket = factory.sockets[4]
+        val listener = factory.listeners[4]
+        listener.onOpen(socket, dummyResponse())
+        listener.onMessage(socket, """{"type":"auth_ok"}""")
+        assertTrue(ch.isConnected)
+
+        // …so the next drop schedules the BASE delay again (attempt 0 → [500, 1000]),
+        // not attempt 4 ([8000, 16000]).
+        listener.onClosed(socket, 1006, "x")
+        assertTrue("delay=${scheduler.lastDelay}", scheduler.lastDelay in 500..1000)
+    }
+
+    // ── Terminal close codes (gateway rejected the device) ─────────────────────
+
+    private fun connectedChannel(factory: FakeFactory, scheduler: ManualScheduler): RealtimeChannel {
+        val ch = channel(factory, scheduler)
+        ch.connect()
+        factory.listeners[0].onOpen(factory.sockets[0], dummyResponse())
+        return ch
+    }
+
+    @Test
+    fun close4401AuthRejectedIsTerminalAndDoesNotReconnect() {
+        val factory = FakeFactory()
+        val scheduler = ManualScheduler()
+        val ch = connectedChannel(factory, scheduler)
+
+        factory.listeners[0].onClosed(factory.sockets[0], RealtimeChannel.CLOSE_UNAUTHORIZED, "unauthorized")
+
+        assertEquals(RealtimeConnectionState.CLOSED, ch.connectionState)
+        assertNull("4401 must not schedule a reconnect", scheduler.pending)
+        assertTrue(ch.isTerminated)
+        assertEquals(4401, ch.lastCloseCode)
+        assertEquals(1, factory.sockets.size)
+    }
+
+    @Test
+    fun close4404DeviceUnknownIsTerminalAndDoesNotReconnect() {
+        val factory = FakeFactory()
+        val scheduler = ManualScheduler()
+        val ch = connectedChannel(factory, scheduler)
+
+        // OkHttp delivers onClosing (server close frame) before onClosed.
+        factory.listeners[0].onClosing(factory.sockets[0], RealtimeChannel.CLOSE_DEVICE_UNKNOWN, "device unknown")
+        factory.listeners[0].onClosed(factory.sockets[0], RealtimeChannel.CLOSE_DEVICE_UNKNOWN, "device unknown")
+
+        assertNull(scheduler.pending)
+        assertTrue(ch.isTerminated)
+        assertEquals(4404, ch.lastCloseCode)
+    }
+
+    @Test
+    fun terminalCloseAfterAuthOkAlsoStopsReconnecting() {
+        val factory = FakeFactory()
+        val scheduler = ManualScheduler()
+        val ch = connectedChannel(factory, scheduler)
+        factory.listeners[0].onMessage(factory.sockets[0], """{"type":"auth_ok"}""")
+        assertTrue(ch.isConnected)
+
+        // e.g. the device was deactivated in the dashboard while online.
+        factory.listeners[0].onClosed(factory.sockets[0], RealtimeChannel.CLOSE_DEVICE_UNKNOWN, "inactive")
+        assertFalse(ch.isConnected)
+        assertNull(scheduler.pending)
+    }
+
+    @Test
+    fun nonTerminalCloseCodesStillReconnect() {
+        for (code in listOf(1001, 1006, 1011, 4000, 4500)) {
+            val factory = FakeFactory()
+            val scheduler = ManualScheduler()
+            val ch = connectedChannel(factory, scheduler)
+            factory.listeners[0].onClosed(factory.sockets[0], code, "x")
+            assertTrue("code $code must keep the back-off reconnect", scheduler.pending != null)
+            assertFalse(ch.isTerminated)
+        }
+    }
+
+    @Test
+    fun transportFailureIsNeverTerminal() {
+        val factory = FakeFactory()
+        val scheduler = ManualScheduler()
+        val ch = connectedChannel(factory, scheduler)
+        factory.listeners[0].onFailure(factory.sockets[0], RuntimeException("reset"), null)
+        assertTrue(scheduler.pending != null)
+        assertFalse(ch.isTerminated)
+    }
+
+    @Test
+    fun explicitConnectAfterTerminalCloseTriesAgain() {
+        val factory = FakeFactory()
+        val scheduler = ManualScheduler()
+        val ch = connectedChannel(factory, scheduler)
+        factory.listeners[0].onClosed(factory.sockets[0], RealtimeChannel.CLOSE_UNAUTHORIZED, "unauthorized")
+        assertTrue(ch.isTerminated)
+
+        ch.connect() // e.g. enableRealtime() after re-registration
+        assertFalse(ch.isTerminated)
+        assertEquals(2, factory.sockets.size)
+        assertEquals(RealtimeConnectionState.CONNECTING, ch.connectionState)
     }
 
     @Test

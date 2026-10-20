@@ -12,7 +12,6 @@ import java.security.spec.ECParameterSpec
 import java.security.spec.ECPoint
 import java.security.spec.ECPrivateKeySpec
 import java.security.spec.ECPublicKeySpec
-import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
 import javax.crypto.Mac
@@ -29,7 +28,8 @@ import org.json.JSONObject
  * decrypt. We decrypt it with the JDK's own crypto (P-256 ECDH + HKDF-SHA256 +
  * AES-128-GCM); no third-party dependency and no Android-only APIs, so the core is
  * pure-JVM unit-testable and runs unchanged in `onMessageReceived`. The device
- * private key never leaves the device.
+ * private key never leaves the device. base64url goes through [Base64Url] because
+ * `java.util.Base64` only exists from API 26 and the SDK supports minSdk 21.
  */
 object VisionPushSeal {
     const val VERSION = "vp-seal-v1"
@@ -216,6 +216,78 @@ object VisionPushSeal {
         }
     }
 
-    fun b64urlDecode(s: String): ByteArray = Base64.getUrlDecoder().decode(s)
-    fun b64urlEncode(b: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(b)
+    /** base64url → bytes; padding optional. Throws [IllegalArgumentException] on malformed input. */
+    fun b64urlDecode(s: String): ByteArray = Base64Url.decode(s)
+
+    /** bytes → unpadded base64url (RFC 4648 §5), the wire form the server expects. */
+    fun b64urlEncode(b: ByteArray): String = Base64Url.encode(b)
+}
+
+/**
+ * RFC 4648 §5 base64url codec: unpadded output, padding tolerated on input.
+ *
+ * Hand-rolled on purpose — it is an alphabet mapping, not cryptography.
+ * `java.util.Base64` requires API 26 (minSdk is 21) and `android.util.Base64` is a
+ * throwing stub in pure-JVM unit tests, so neither can back [VisionPushSeal]; this
+ * runs identically on every supported API level and off-device. Behaviour mirrors
+ * `java.util.Base64.getUrlDecoder()`: a character outside the alphabet or an
+ * impossible length (4n+1) throws [IllegalArgumentException].
+ */
+internal object Base64Url {
+    private const val ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    private val DECODE = IntArray(128) { -1 }.also { table ->
+        ALPHABET.forEachIndexed { index, c -> table[c.code] = index }
+    }
+
+    fun encode(src: ByteArray): String {
+        val out = StringBuilder((src.size + 2) / 3 * 4)
+        var i = 0
+        while (i + 3 <= src.size) {
+            val n = ((src[i].toInt() and 0xFF) shl 16) or
+                ((src[i + 1].toInt() and 0xFF) shl 8) or
+                (src[i + 2].toInt() and 0xFF)
+            out.append(ALPHABET[(n ushr 18) and 0x3F])
+            out.append(ALPHABET[(n ushr 12) and 0x3F])
+            out.append(ALPHABET[(n ushr 6) and 0x3F])
+            out.append(ALPHABET[n and 0x3F])
+            i += 3
+        }
+        when (src.size - i) {
+            1 -> {
+                val n = (src[i].toInt() and 0xFF) shl 16
+                out.append(ALPHABET[(n ushr 18) and 0x3F])
+                out.append(ALPHABET[(n ushr 12) and 0x3F])
+            }
+            2 -> {
+                val n = ((src[i].toInt() and 0xFF) shl 16) or ((src[i + 1].toInt() and 0xFF) shl 8)
+                out.append(ALPHABET[(n ushr 18) and 0x3F])
+                out.append(ALPHABET[(n ushr 12) and 0x3F])
+                out.append(ALPHABET[(n ushr 6) and 0x3F])
+            }
+        }
+        return out.toString()
+    }
+
+    fun decode(src: String): ByteArray {
+        var end = src.length
+        while (end > 0 && src[end - 1] == '=') end-- // trailing padding is optional
+        val rem = end % 4
+        require(rem != 1) { "Invalid base64url length: $end" }
+        val out = ByteArray(end / 4 * 3 + if (rem == 0) 0 else rem - 1)
+        var acc = 0
+        var bits = 0
+        var o = 0
+        for (i in 0 until end) {
+            val c = src[i]
+            val v = if (c.code < DECODE.size) DECODE[c.code] else -1
+            require(v >= 0) { "Illegal base64url character at index $i" }
+            acc = ((acc and 0xFFF) shl 6) or v
+            bits += 6
+            if (bits >= 8) {
+                bits -= 8
+                out[o++] = (acc ushr bits).toByte()
+            }
+        }
+        return out
+    }
 }

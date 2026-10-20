@@ -17,14 +17,38 @@
     <!-- Required on API 33+ to post notifications (runtime-requested by SDK) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Required for scheduling WorkManager constraints (boot-completed retry) -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-
-    <!-- Required for exact-time WorkManager constraints on API 31+ -->
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-
     <!-- Required for vibration on notification display -->
     <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!--
+        Location permissions for optional on-device geofencing (VisionPush.enableGeofencing()).
+        The SDK NEVER prompts for these — the HOST APP must request them at runtime at a
+        contextually appropriate moment:
+          * ACCESS_FINE_LOCATION       — required for any geofence monitoring (Play services
+                                         geofencing needs precise location).
+          * ACCESS_COARSE_LOCATION     — must be declared TOGETHER with FINE: since Android 12
+                                         (API 31) a fine-location request is only valid when
+                                         both are declared, and the user may grant approximate
+                                         location only. GeofenceManager checks for FINE at
+                                         runtime and stays inactive with COARSE alone —
+                                         geofences cannot be evaluated at approximate accuracy.
+          * ACCESS_BACKGROUND_LOCATION — required on Android 10+ (API 29) to receive geofence
+                                         transitions while the app is backgrounded.
+        Apps that do not use geofencing can ignore these; declaring them in the library manifest
+        does not by itself trigger a runtime prompt or Play review (no prominent disclosure is
+        needed until the host actually requests + uses background location).
+    -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!--
+        NOTE: SCHEDULE_EXACT_ALARM and RECEIVE_BOOT_COMPLETED are intentionally NOT declared.
+        All background work uses WorkManager (no exact alarms), and WorkManager's own merged
+        library manifest already declares RECEIVE_BOOT_COMPLETED for its boot-reschedule
+        receiver — declaring SCHEDULE_EXACT_ALARM here would needlessly push host apps through
+        Google Play's exact-alarm review.
+    -->
 
     <application>
 
@@ -51,6 +75,18 @@
         -->
         <receiver
             android:name="de.visionlab.visionpush.NotificationTracker$OpenReceiver"
+            android:exported="false" />
+
+        <!-- ── Geofence Transition Receiver ──────────────────────────────── -->
+        <!--
+            Receives geofence ENTER/EXIT transitions from Google Play services via the
+            explicit PendingIntent set up by GeofenceManager, then enqueues a
+            GeofenceEventWorker to report the transition. Only active when the host app
+            calls VisionPush.enableGeofencing() and has granted location permission.
+            exported="false": delivery is via an explicit (in-process) PendingIntent only.
+        -->
+        <receiver
+            android:name="de.visionlab.visionpush.GeofenceTransitionReceiver"
             android:exported="false" />
 
         <!-- ── WorkManager Initializer (disable auto-init for custom init) ── -->

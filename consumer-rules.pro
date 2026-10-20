@@ -24,6 +24,17 @@
 # ── Keep WorkManager workers (instantiated by class name at runtime) ─────────
 -keep public class de.visionlab.visionpush.NotificationTracker$TrackEventWorker { *; }
 -keep public class de.visionlab.visionpush.RegistrationSyncWorker { *; }
+-keep public class de.visionlab.visionpush.GeofenceEventWorker { *; }
+
+# ── Keep geofencing entry points (manifest-referenced receiver + public API) ──
+# GeofenceTransitionReceiver is referenced by class name in the merged manifest;
+# GeofenceManager/GeofenceData are reached via VisionPush.enableGeofencing().
+-keep public class de.visionlab.visionpush.GeofenceTransitionReceiver { *; }
+-keep class de.visionlab.visionpush.GeofenceManager { *; }
+-keep class de.visionlab.visionpush.GeofenceData { *; }
+
+# ── Google Play services Location (used by GeofenceManager) ──────────────────
+-dontwarn com.google.android.gms.location.**
 
 # ── Keep Kotlin metadata (required for Kotlin reflection and coroutines) ─────
 -keepattributes *Annotation*

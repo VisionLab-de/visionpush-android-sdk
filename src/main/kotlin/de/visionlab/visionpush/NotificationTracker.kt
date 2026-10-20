@@ -4,11 +4,11 @@ import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.Data
 import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.Worker
@@ -81,41 +81,64 @@ class NotificationTracker private constructor() {
 
             // Route the deep-link intent
             if (!deepLink.isNullOrBlank()) {
-                launchDeepLink(context, deepLink)
+                launchDeepLink(context, deepLink, intent)
             } else if (eventType == NotificationEvent.EventType.OPENED ||
                        eventType == NotificationEvent.EventType.ACTION_TAPPED) {
-                launchHostApp(context)
+                launchHostApp(context, intent)
             }
         }
 
         /** Launches the host app launcher activity. */
-        private fun launchHostApp(context: Context) {
+        private fun launchHostApp(context: Context, source: Intent) {
             val launchIntent = context.packageManager
                 .getLaunchIntentForPackage(context.packageName)
                 ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 ?: return
+            forwardOpenExtras(source, launchIntent)
             context.startActivity(launchIntent)
         }
 
         /** Fires an implicit intent for [deepLink] URI. */
-        private fun launchDeepLink(context: Context, deepLink: String) {
+        private fun launchDeepLink(context: Context, deepLink: String, source: Intent) {
+            // Block schemes that could execute code or access private data — the
+            // SAME allowlist the in-app-message action path uses (UrlSecurity).
+            val uri = UrlSecurity.safeUri(deepLink)
+            if (uri == null) {
+                VisionPushLogger.w(TAG, "Deep-link blocked – unsafe or unparseable URL.")
+                launchHostApp(context, source)
+                return
+            }
             try {
-                val uri = Uri.parse(deepLink)
-                val scheme = uri.scheme?.lowercase()
-                // Block schemes that could execute code or access private data.
-                val blockedSchemes = setOf("javascript", "data", "vbscript", "content", "file")
-                if (scheme == null || blockedSchemes.contains(scheme)) {
-                    VisionPushLogger.w(TAG, "Deep-link blocked – unsafe scheme '$scheme'.")
-                    launchHostApp(context)
-                    return
-                }
                 val intent = Intent(Intent.ACTION_VIEW, uri).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
+                forwardOpenExtras(source, intent)
                 context.startActivity(intent)
             } catch (e: Exception) {
                 VisionPushLogger.w(TAG, "Failed to launch deep-link '$deepLink': ${e.message}")
-                launchHostApp(context)
+                launchHostApp(context, source)
+            }
+        }
+
+        /**
+         * Copies the VisionPush identification extras from the tracking intent
+         * onto the intent that (re)launches the UI.
+         *
+         * Without this the launch intent carries no VisionPush context, so an
+         * app cold-started by a notification tap (e.g. the Flutter plugin's
+         * `getInitialNotification`) cannot resolve which notification launched
+         * it — the open event itself fires before any app-level handler is
+         * registered in a fresh process.
+         */
+        private fun forwardOpenExtras(source: Intent, target: Intent) {
+            source.getStringExtra(EXTRA_NOTIFICATION_ID)?.let {
+                target.putExtra(EXTRA_NOTIFICATION_ID, it)
+            }
+            source.getStringExtra(EXTRA_CAMPAIGN_ID)?.let {
+                target.putExtra(EXTRA_CAMPAIGN_ID, it)
+            }
+            source.getStringExtra(EXTRA_DEEP_LINK)?.let {
+                target.putExtra(EXTRA_DEEP_LINK, it)
             }
         }
     }
@@ -143,6 +166,12 @@ class NotificationTracker private constructor() {
             val eventType = NotificationEvent.EventType.values()
                 .firstOrNull { it.apiKey == eventTypeKey }
                 ?: return Result.failure()
+
+            // Consent may have been revoked between enqueue and execution — drop, don't send.
+            if (!VisionPush.hasConsent) {
+                VisionPushLogger.d(TAG, "Consent not given – dropping queued $eventType event.")
+                return Result.failure()
+            }
 
             val event = NotificationEvent(
                 notificationId = notificationId,
@@ -189,10 +218,22 @@ class NotificationTracker private constructor() {
         private const val WORK_TAG = "vp_track_event"
 
         /**
+         * Test seam: when set, receives the built request instead of WorkManager, so
+         * unit tests can assert the consent gate without initializing WorkManager.
+         */
+        @Volatile internal var workEnqueuer: ((Context, OneTimeWorkRequest) -> Unit)? = null
+
+        /**
          * Enqueues a [TrackEventWorker] via WorkManager.
          *
          * Uses a network constraint so WorkManager waits for connectivity before
          * attempting the API call, and applies exponential back-off for retries.
+         *
+         * **Consent gate.** The automatic DELIVERED / OPENED / DISMISSED events from the
+         * display and tap paths land here too — not only the public `trackOpened()`,
+         * which throws [VisionPushError.ConsentRequired]. Without consent nothing may
+         * leave the device: displaying the notification is fine, reporting it is not,
+         * so the event is dropped here (debug-logged, never thrown).
          */
         internal fun enqueueTrackingWork(
             context: Context,
@@ -201,6 +242,11 @@ class NotificationTracker private constructor() {
             actionId: String?,
             campaignId: String? = null
         ) {
+            if (!VisionPush.hasConsent) {
+                VisionPushLogger.d(TAG, "Consent not given – dropping $eventType event for $notificationId.")
+                return
+            }
+
             val inputData = Data.Builder()
                 .putString(WorkerKeys.KEY_NOTIFICATION_ID, notificationId)
                 .putString(WorkerKeys.KEY_EVENT_TYPE, eventType.apiKey)
@@ -223,7 +269,21 @@ class NotificationTracker private constructor() {
                 .addTag(WORK_TAG)
                 .build()
 
-            WorkManager.getInstance(context).enqueue(request)
+            val enqueuer = workEnqueuer
+            if (enqueuer != null) enqueuer(context, request) else WorkManager.getInstance(context).enqueue(request)
+        }
+
+        /**
+         * Cancels every tracking event still waiting in WorkManager. Called when consent
+         * is revoked so events enqueued moments earlier do not leave the device later.
+         */
+        internal fun cancelPendingWork(context: Context) {
+            try {
+                WorkManager.getInstance(context).cancelAllWorkByTag(WORK_TAG)
+            } catch (e: IllegalStateException) {
+                // WorkManager not initialized in this process → nothing queued to cancel.
+                VisionPushLogger.d(TAG, "WorkManager unavailable – no pending tracking work to cancel.")
+            }
         }
 
         private const val INITIAL_BACKOFF_SECONDS = 15L

@@ -1,10 +1,14 @@
 package de.visionlab.visionpush
 
 import org.json.JSONObject
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
+import java.util.Base64
+import java.util.Random
 
 /**
  * Sealed-payload decryption tests.
@@ -95,5 +99,46 @@ class SealedPayloadTest {
         assertEquals(0x04, g.keys.publicKey[0].toInt() and 0xFF)
         assertEquals(16, g.keys.auth.size)
         assertEquals(VisionPushSeal.ALG, g.alg)
+    }
+
+    // ── Base64Url codec (hand-rolled: java.util.Base64 needs API 26, minSdk is 21) ──
+
+    @Test
+    fun base64url_matchesJdkReferenceForAllLengths() {
+        val rnd = Random(0x5EA1)
+        val jdkUnpadded = Base64.getUrlEncoder().withoutPadding()
+        val jdkPadded = Base64.getUrlEncoder()
+        val jdkDecoder = Base64.getUrlDecoder()
+        for (len in 0..96) {
+            repeat(8) {
+                val bytes = ByteArray(len).also(rnd::nextBytes)
+                val ours = Base64Url.encode(bytes)
+                assertEquals("encode len=$len", jdkUnpadded.encodeToString(bytes), ours)
+                assertArrayEquals("decode unpadded len=$len", bytes, Base64Url.decode(ours))
+                assertArrayEquals("decode padded len=$len", bytes, Base64Url.decode(jdkPadded.encodeToString(bytes)))
+                assertArrayEquals("jdk decodes ours len=$len", bytes, jdkDecoder.decode(ours))
+            }
+        }
+    }
+
+    @Test
+    fun base64url_usesUrlSafeAlphabetWithoutPadding() {
+        // 0xFB 0xFF is "+/8=" in classic base64 and "-_8" in base64url.
+        val enc = Base64Url.encode(byteArrayOf(0xFB.toByte(), 0xFF.toByte()))
+        assertEquals("-_8", enc)
+        assertEquals("", Base64Url.encode(ByteArray(0)))
+        assertArrayEquals(ByteArray(0), Base64Url.decode(""))
+    }
+
+    @Test
+    fun base64url_rejectsMalformedInputLikeTheJdk() {
+        for (bad in listOf("a", "abcde", "abc+", "ab/c", "ab=c", "ab cd", "\u00e4bcd")) {
+            try {
+                Base64Url.decode(bad)
+                fail("expected IllegalArgumentException for '$bad'")
+            } catch (expected: IllegalArgumentException) {
+                // matches java.util.Base64.getUrlDecoder(), which open() relies on
+            }
+        }
     }
 }

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    VisionPush Android SDK – Auto Backup exclusion rules (Android 6–11, `android:fullBackupContent`).
+
+    The SDK keeps its device identity in EncryptedSharedPreferences. The Android Keystore
+    master key that encrypts that file is NEVER part of a backup, so a restored copy is
+    unreadable: the SDK would fall back to an empty store, mint a new installation id and
+    new sealed-payload keys, and register a second device row. Excluding the files makes a
+    restore behave like a clean install instead.
+
+    NOT referenced from the SDK manifest on purpose: `android:fullBackupContent` on
+    <application> is a single attribute, and the manifest merger fails the build when the
+    host app declares its own rules file (the Android Studio templates do). Copy these
+    <exclude> lines into YOUR rules file — see README.md "Backup & Restore".
+
+    Deliberately NOT excluded (a restore should keep them): visionpush_consent.xml (the
+    user's consent decision), visionpush_device_state.xml (the opt-out flag), history.
+-->
+<full-backup-content>
+    <!-- EncryptedSharedPreferences store: installation id, device id, sealed keys. -->
+    <exclude domain="sharedpref" path="visionpush_device.xml" />
+    <!-- Plain fallback used when the encrypted store cannot be opened. -->
+    <exclude domain="sharedpref" path="visionpush_device_plain.xml" />
+    <!-- androidx.security keysets: useless without the Keystore master key. -->
+    <exclude domain="sharedpref" path="__androidx_security_crypto_encrypted_prefs_key_keyset__.xml" />
+    <exclude domain="sharedpref" path="__androidx_security_crypto_encrypted_prefs_value_keyset__.xml" />
+</full-backup-content>

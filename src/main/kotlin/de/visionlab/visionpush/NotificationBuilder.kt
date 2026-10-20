@@ -14,6 +14,7 @@ import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.IOException
@@ -168,8 +169,23 @@ internal class NotificationBuilder(private val context: Context) {
         val builtNotification = builder.build()
         postNotification(notificationId, builtNotification)
 
-        // Track delivered event via WorkManager — deduplicated so FCM retries don't
-        // result in duplicate analytics events for the same VP notification ID.
+        // Track delivered event (deduplicated). Shares the same dedup cache as the
+        // no-UI path in VisionPush.deliverNotification(), so a single VP notification ID
+        // produces exactly one DELIVERED event whether or not a system UI is posted.
+        trackDeliveredOnce(notification)
+
+        return notificationId
+    }
+
+    /**
+     * Enqueues a single DELIVERED event for [notification] via WorkManager, deduplicated
+     * against [recentlyDeliveredIds] so FCM retries — or a notification delivered without a
+     * system UI (suppressed foreground / `show_system_notification=false`) — never double-count.
+     *
+     * Idempotent per VP notification ID for the lifetime of this process. Called by [show]
+     * after posting, and by [VisionPush] when no system notification is shown.
+     */
+    internal fun trackDeliveredOnce(notification: VisionPushNotification) {
         val alreadyTracked = synchronized(recentlyDeliveredIds) {
             if (recentlyDeliveredIds.containsKey(notification.id)) {
                 true
@@ -187,8 +203,6 @@ internal class NotificationBuilder(private val context: Context) {
                 campaignId = notification.campaignId
             )
         }
-
-        return notificationId
     }
 
     // ── Intent builders ─────────────────────────────────────────────────────
@@ -309,6 +323,14 @@ internal class NotificationBuilder(private val context: Context) {
      *
      * Returns `null` on any I/O error, connection error, or if the response is
      * not a valid image so that callers can gracefully degrade.
+     *
+     * Defended in depth against oversized (or hostile) images — see [ImageGuard]:
+     * - the compressed bytes are read through a HARD cap ([ImageGuard.MAX_BYTES]) that
+     *   does not trust `Content-Length` (it is `-1` on chunked responses and can lie),
+     * - the image is measured with `inJustDecodeBounds` first and downsampled to the
+     *   [ImageGuard.MAX_PIXELS] budget — or rejected — before the real decode,
+     * - every failure INCLUDING [OutOfMemoryError] degrades to `null` instead of
+     *   propagating through the SDK coroutine scope and crashing the host app.
      */
     private suspend fun fetchBitmap(url: String): Bitmap? = withContext(Dispatchers.IO) {
         var connection: HttpURLConnection? = null
@@ -320,21 +342,53 @@ internal class NotificationBuilder(private val context: Context) {
                 connect()
             }
             if (connection.responseCode != HttpURLConnection.HTTP_OK) return@withContext null
-            val contentLength = connection.contentLength
-            if (contentLength > MAX_BITMAP_BYTES) {
-                VisionPushLogger.w(TAG, "Bitmap at $url exceeds size limit ($contentLength bytes) – skipping.")
+            // Cheap early exit when the server is honest; the streaming cap below is
+            // the one that actually protects us.
+            val declaredLength = connection.contentLength
+            if (declaredLength > ImageGuard.MAX_BYTES) {
+                VisionPushLogger.w(TAG, "Bitmap at $url exceeds size limit ($declaredLength bytes) – skipping.")
                 return@withContext null
             }
-            BitmapFactory.decodeStream(connection.inputStream)
+            val bytes = connection.inputStream.use { ImageGuard.readCapped(it, ImageGuard.MAX_BYTES) }
+            if (bytes == null) {
+                VisionPushLogger.w(TAG, "Bitmap at $url exceeded the ${ImageGuard.MAX_BYTES}-byte cap while streaming – skipping.")
+                return@withContext null
+            }
+            decodeWithinBudget(bytes, url)
+        } catch (e: CancellationException) {
+            throw e // never swallow coroutine cancellation
         } catch (e: IOException) {
             VisionPushLogger.w(TAG, "Failed to fetch bitmap from $url: ${e.message}")
             null
-        } catch (e: Exception) {
-            VisionPushLogger.w(TAG, "Unexpected error fetching bitmap: ${e.message}")
+        } catch (t: Throwable) {
+            // Includes OutOfMemoryError from the decoder: an oversized image must degrade
+            // to "no picture", not take the host process down.
+            VisionPushLogger.w(TAG, "Unexpected error fetching bitmap from $url: ${t.javaClass.simpleName}: ${t.message}")
             null
         } finally {
             connection?.disconnect()
         }
+    }
+
+    /**
+     * Measures [bytes] first (`inJustDecodeBounds`), then decodes with the power-of-two
+     * `inSampleSize` that keeps the result within [ImageGuard.MAX_PIXELS]. Returns `null`
+     * when the bounds are invalid or the image is too large even for the largest
+     * sample size.
+     */
+    private fun decodeWithinBudget(bytes: ByteArray, url: String): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val sampleSize = ImageGuard.sampleSizeFor(bounds.outWidth, bounds.outHeight, ImageGuard.MAX_PIXELS)
+        if (sampleSize == null) {
+            VisionPushLogger.w(
+                TAG,
+                "Bitmap at $url rejected: bounds ${bounds.outWidth}x${bounds.outHeight} are invalid or exceed the pixel budget."
+            )
+            return null
+        }
+        val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
     }
 
     // ── Notification posting ────────────────────────────────────────────────
@@ -394,8 +448,7 @@ internal class NotificationBuilder(private val context: Context) {
         private const val BITMAP_CONNECT_TIMEOUT_MS = 5_000
         private const val BITMAP_READ_TIMEOUT_MS = 10_000
 
-        /** Maximum allowed bitmap download size (5 MB). Prevents OOM from oversized images. */
-        private const val MAX_BITMAP_BYTES = 5 * 1024 * 1024
+        // Bitmap byte cap + decoded-pixel budget live in [ImageGuard] (pure, unit-tested).
 
         /** Maximum VP notification IDs remembered for delivered-event deduplication. */
         private const val DEDUP_CACHE_SIZE = 50
